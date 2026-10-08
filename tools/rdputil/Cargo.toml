@@ -1,0 +1,25 @@
+[package]
+name = "rdputil"
+version = "0.1.0"
+edition = "2021"
+description = "Standalone RDP test client driving IronRDP (path deps into experiments/IronRDP-src)"
+
+[dependencies]
+ironrdp = { path = "../../experiments/IronRDP-src/crates/ironrdp", features = [
+    "cliprdr", "connector", "session", "graphics", "input", "svc", "dvc", "displaycontrol",
+] }
+ironrdp-pdu = { path = "../../experiments/IronRDP-src/crates/ironrdp-pdu" }
+ironrdp-blocking = { path = "../../experiments/IronRDP-src/crates/ironrdp-blocking" }
+ironrdp-graphics = { path = "../../experiments/IronRDP-src/crates/ironrdp-graphics" }
+pico-args = "0.5"
+serde_json = "1"
+x509-cert = { version = "0.3", default-features = false, features = ["std"] }
+anyhow = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+sspi = { version = "0.21", features = ["network_client"] }
+tokio-rustls = "0.26"
+tracing = { version = "0.1", features = ["log"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+debug = false
