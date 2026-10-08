@@ -33,7 +33,7 @@ use anyhow::Context as _;
 use connector::Credentials;
 use ironrdp::cliprdr::backend::CliprdrBackend;
 use ironrdp::cliprdr::pdu::{
-    ClipboardFormat, ClipboardFormatId, ClipboardFormatName, ClipboardGeneralCapabilityFlags, FileContentsRequest,
+    ClipboardFormat, ClipboardFormatId, ClipboardGeneralCapabilityFlags, FileContentsRequest,
     FileContentsResponse, FormatDataRequest, FormatDataResponse, LockDataId,
 };
 use ironrdp::cliprdr::{Cliprdr, CliprdrClient};
@@ -1133,6 +1133,22 @@ pub(crate) fn send_slow_event(
     Ok(())
 }
 
+/// The four standard text formats, announced nameless. This mirrors the exact
+/// Format List shape Windows rdpclip itself broadcasts (flags=0, entry = id +
+/// empty UTF-16 name): named entries — however canonical — are acknowledged
+/// but registered as empty guest clipboard data with no delayed rendering, so
+/// pastes find nothing and no Format Data Request is ever sent. The guest's
+/// own text copy produces exactly the group [CF_UNICODETEXT, CF_LOCALE,
+/// CF_TEXT, CF_OEMTEXT].
+pub(crate) fn golden_text_formats() -> [ClipboardFormat; 4] {
+    [
+        ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT),
+        ClipboardFormat::new(ClipboardFormatId::CF_TEXT),
+        ClipboardFormat::new(ClipboardFormatId::CF_OEMTEXT),
+        ClipboardFormat::new(ClipboardFormatId::CF_LOCALE),
+    ]
+}
+
 /// Progresses the CLIPRDR initialization: once the server's Monitor Ready has
 /// flagged the backend, sends the (empty) Format List advertisement that
 /// completes the handshake. Called from the drive loop's pump section.
@@ -1161,14 +1177,14 @@ pub(crate) fn clip_tick(framed: &mut AnyFramed, active_stage: &mut ActiveStage, 
             return;
         };
         let name = actor.channel_name();
-        // Windows servers ignore an empty initial Format List and never send the
-        // Format List Response that flips the channel to Ready (field-observed),
-        // so advertise CF_UNICODETEXT even though we hold no local
-        // clipboard content — the `cb` read path never serves Format Data Requests.
-        // With USE_LONG_FORMAT_NAMES the entry must carry the canonical Windows
-        // name; an empty name makes rdpclip drop the whole list silently.
-        let synthetic = [ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)
-            .with_name(ClipboardFormatName::new_static("Unicode Text"))];
+        // Advertise the standard text formats even though we hold no local
+        // clipboard content yet: an empty list is ignored by Windows servers
+        // (no Format List Response ever arrives, so the channel never turns
+        // Ready), and named entries get registered as empty guest clipboard
+        // data instead of delayed-rendered formats (see golden_text_formats).
+        // A guest paste before any clipboard_set is answered with a failed
+        // Format Data Response, mirroring an empty clipboard.
+        let synthetic = golden_text_formats();
         match actor.initiate_copy(&synthetic) {
             Ok(msgs) => (name, msgs),
             Err(e) => {

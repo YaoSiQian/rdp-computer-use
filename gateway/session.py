@@ -103,16 +103,20 @@ class RdpSession:
             "--label", self.name,
             "--artifacts-dir", str(self.artifacts_dir.resolve()),
             "--golden-rule", "1" if self.golden_rule else "0",
+            *(["--cliprdr"] if self.cliprdr else []),
             *(self.extra_args),
         ]
         env = {**os.environ, "RDPUTIL_PASS": self.password}
         if self.cliprdr:
             env["RDPUTIL_CLIPRDR"] = "1"
+        # Daemon tracing (connection ladder, cliprdr wire events) is the
+        # primary diagnostic surface — keep it next to the artifacts.
+        self._stderr_file = open(self.artifacts_dir / "daemon_stderr.log", "w", encoding="utf-8", errors="replace")
         self._proc = subprocess.Popen(
             argv,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=self._stderr_file,
             text=True,
             encoding="utf-8",
             env=env,
@@ -133,6 +137,7 @@ class RdpSession:
         except subprocess.TimeoutExpired:
             self._proc.kill()
             self._proc.wait(timeout=5)
+        self._stderr_file.close()
         self._proc = None
         self.status = "closed"
         self.evidence("session_close", {})

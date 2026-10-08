@@ -29,9 +29,7 @@ use std::time::Instant;
 use anyhow::Context as _;
 use serde_json::{json, Value};
 
-use ironrdp::cliprdr::pdu::{
-    ClipboardFormat, ClipboardFormatId, ClipboardFormatName, FormatDataResponse, OwnedFormatDataResponse,
-};
+use ironrdp::cliprdr::pdu::{ClipboardFormatId, FormatDataResponse, OwnedFormatDataResponse};
 use ironrdp::cliprdr::CliprdrClient;
 use ironrdp::connector::connection_activation::ConnectionActivationFactory;
 use ironrdp::connector::ConnectionResult;
@@ -48,8 +46,8 @@ use ironrdp::svc::SvcProcessor as _;
 use ironrdp_pdu::WriteBuf;
 
 use crate::{
-    clip_tick, connect, frame_hash, pump_until, send_input_event, send_t120_announce, AnyFramed, ClipState,
-    CommonArgs,
+    clip_tick, connect, frame_hash, golden_text_formats, pump_until, send_input_event, send_t120_announce, AnyFramed,
+    ClipState, CommonArgs,
 };
 
 const PUMP_SLICE_MS: u64 = 250;
@@ -555,7 +553,12 @@ impl Daemon {
         self.wait_clip_ready()?;
         let clip = self.clip.as_ref().unwrap();
         let formats = clip.formats.lock().unwrap().clone();
-        if !formats.contains(&ClipboardFormatId::CF_UNICODETEXT.0) {
+        // Probe mode 5: request anyway. If a just-advertised format was
+        // registered on the guest clipboard (delayed rendering), rdpclip must
+        // ask us to render it before answering — visible as a Format Data
+        // Request on stderr — then return the data. A FAIL response means the
+        // advertisement was never registered.
+        if formats.is_empty() && std::env::var("RDPUTIL_CLIP_MODE").as_deref() != Ok("5") {
             return Err(serr("E_CLIP", format!("guest offers no CF_UNICODETEXT (formats={formats:?})")));
         }
         *clip.response.lock().unwrap() = None;
@@ -587,6 +590,11 @@ impl Daemon {
             }
             pump_until(framed, stage, image, Instant::now() + Duration::from_millis(PUMP_SLICE_MS), Some(activation))
                 .map_err(SrvErr::from)?;
+            // A delayed-rendered guest format makes rdpclip ask US for the
+            // data before it can answer; serve that request from
+            // write_pending right here (the main loop's answer_clip_write
+            // only runs between ops).
+            answer_clip_write(framed, stage, clip)?;
         }
     }
 
@@ -607,6 +615,10 @@ impl Daemon {
             pump_until(framed, stage, image, Instant::now() + Duration::from_millis(PUMP_SLICE_MS), Some(activation))
                 .map_err(SrvErr::from)?;
         }
+        // Our advertisement replaced the guest clipboard; whatever the guest
+        // offered before is gone until its own next copy broadcast. Reading
+        // back our own push yields an empty/failed response.
+        clip.formats.lock().unwrap().clear();
         Ok(json!({"chars": text.chars().count()}))
     }
 
@@ -787,6 +799,15 @@ impl Daemon {
                 let io_channel_id = cr.io_channel_id;
                 let repaint = self.reconnects > 0;
                 let (mut stage, activation, w, h) = build_stage(cr);
+                // Outgoing SVC traffic is fragmented at the negotiated VirtualChannel
+                // chunk size. CHANNEL_CHUNK_LENGTH is the floor every peer reassembles
+                // reliably; clamp to it rather than trusting an advertised larger size.
+                let negotiated = stage.static_channel_chunk_size();
+                let chunk_size = negotiated.min(ironrdp::svc::CHANNEL_CHUNK_LENGTH);
+                if chunk_size != negotiated {
+                    stage.set_static_channel_chunk_size(chunk_size);
+                }
+                eprintln!("SERVE svc chunk negotiated={negotiated} used={chunk_size}");
                 let mut framed = framed;
                 if std::env::var("RDPUTIL_T120").as_deref() != Ok("0") {
                     if let Err(e) = send_t120_announce(&mut stage, &mut framed, user_channel_id, io_channel_id) {
@@ -907,8 +928,14 @@ fn answer_clip_write(framed: &mut AnyFramed, stage: &mut ActiveStage, clip: &Cli
     }
     let pending = clip.write_pending.lock().unwrap().clone();
     let response: OwnedFormatDataResponse = match pending {
-        Some(bytes) => FormatDataResponse::new_data(bytes),
-        None => FormatDataResponse::new_error(),
+        Some(ref bytes) => {
+            eprintln!("CLIP format-data-response len={} (client->guest write path)", bytes.len());
+            FormatDataResponse::new_data(bytes.clone())
+        }
+        None => {
+            eprintln!("CLIP format-data-response error (no pending write payload)");
+            FormatDataResponse::new_error()
+        }
     };
     let (name, msgs) = {
         let Some(actor) = stage.get_svc_processor_mut::<CliprdrClient>() else {
@@ -923,19 +950,18 @@ fn answer_clip_write(framed: &mut AnyFramed, stage: &mut ActiveStage, clip: &Cli
     Ok(())
 }
 
-/// Sends a fresh Format List advertisement (CF_UNICODETEXT) so the guest picks
-/// up new clipboard content after `clipboard_set`. Per-[MS-RDPECLIP] each
-/// Format List replaces the previous one. Uses the same per-PDU segment
+/// Sends a fresh Format List advertisement (standard text group) so the guest
+/// picks up new clipboard content after `clipboard_set`. Per-[MS-RDPECLIP]
+/// each Format List replaces the previous one. Uses the same per-PDU segment
 /// separation the init path was field-proven to require.
 fn advertise_formats(framed: &mut AnyFramed, stage: &mut ActiveStage) -> anyhow::Result<()> {
-    let synthetic = [ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)
-        .with_name(ClipboardFormatName::new_static("Unicode Text"))];
+    let formats = golden_text_formats();
     let (name, msgs) = {
         let Some(actor) = stage.get_svc_processor_mut::<CliprdrClient>() else {
             anyhow::bail!("cliprdr channel missing");
         };
         let name = actor.channel_name();
-        let msgs = actor.initiate_copy(&synthetic).context("initiate_copy")?;
+        let msgs = actor.initiate_copy(&formats).context("initiate_copy")?;
         (name, msgs)
     };
     let msgs: Vec<_> = msgs.into();
