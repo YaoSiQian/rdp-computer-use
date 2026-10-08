@@ -1,0 +1,122 @@
+"""MCP stdio surface: same tools, one target per server process.
+
+Run: python -m gateway --mcp --profile win10
+The screenshot tool returns the scaled image plus JSON metadata; the rest
+return JSON strings.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+
+from mcp.server.fastmcp import FastMCP, Image
+
+from .pool import SessionPool
+from .session import GatewayError
+
+
+def create_mcp(pool: SessionPool, profile: str) -> FastMCP:
+    mcp = FastMCP(f"rdp-{profile}")
+
+
+    def _box():
+        return pool.toolbox(profile)
+
+
+    def _json(obj) -> str:
+        return json.dumps(obj, ensure_ascii=False)
+
+
+    @mcp.tool()
+    async def screenshot(wait_stable_ms: int = 1500, tol_px: int = 64) -> list:
+        """Take a screenshot of the remote desktop.
+
+        Returns the image (scaled to fit 1024x768) plus geometry metadata:
+        `scale` maps observation coordinates onto native ones — multiply model
+        x/y by 1/scale before calling click/move with native=true, or just use
+        observation coordinates directly (they are mapped automatically).
+        """
+        try:
+            obs = _box().screenshot(wait_stable_ms, tol_px)
+        except GatewayError as e:
+            return [_json({"ok": False, "code": e.code, "detail": e.detail})]
+        png_bytes = base64.b64decode(obs.pop("image_base64"))
+        meta = _json(obs)
+        return [Image(data=png_bytes, format="png"), meta]
+
+
+    @mcp.tool()
+    async def click(x: int, y: int, button: str = "left", double: bool = False, native: bool = False) -> str:
+        """Click at (x, y). Coordinates are in the last screenshot's scaled
+        space unless native=true. `button` is left/right/middle."""
+        try:
+            return _json(_box().click(x, y, button, double, native))
+        except GatewayError as e:
+            return _json({"ok": False, "code": e.code, "detail": e.detail})
+
+
+    @mcp.tool()
+    async def move(x: int, y: int, native: bool = False) -> str:
+        """Move the pointer without clicking."""
+        try:
+            return _json(_box().move(x, y, native))
+        except GatewayError as e:
+            return _json({"ok": False, "code": e.code, "detail": e.detail})
+
+
+    @mcp.tool()
+    async def type_text(text: str) -> str:
+        """Type text into the focused window (US layout)."""
+        try:
+            return _json(_box().type_text(text))
+        except GatewayError as e:
+            return _json({"ok": False, "code": e.code, "detail": e.detail})
+
+
+    @mcp.tool()
+    async def key(combo: str) -> str:
+        """Press a key combo, e.g. "enter", "ctrl+shift+esc", "alt+tab"."""
+        try:
+            return _json(_box().key(combo))
+        except GatewayError as e:
+            return _json({"ok": False, "code": e.code, "detail": e.detail})
+
+
+    @mcp.tool()
+    async def wait(ms: int) -> str:
+        """Sleep on the guest-side pump so desktop effects settle."""
+        try:
+            return _json(_box().wait(ms))
+        except GatewayError as e:
+            return _json({"ok": False, "code": e.code, "detail": e.detail})
+
+
+    @mcp.tool()
+    async def clipboard_get() -> str:
+        """Read the guest clipboard as text."""
+        try:
+            return _json(_box().clipboard_get())
+        except GatewayError as e:
+            return _json({"ok": False, "code": e.code, "detail": e.detail})
+
+
+    @mcp.tool()
+    async def clipboard_set(text: str) -> str:
+        """Write text to the guest clipboard; follow with key "ctrl+v" to paste."""
+        try:
+            return _json(_box().clipboard_set(text))
+        except GatewayError as e:
+            return _json({"ok": False, "code": e.code, "detail": e.detail})
+
+
+    @mcp.tool()
+    async def state() -> str:
+        """Session state: uptime, input counters, last death signature."""
+        try:
+            return _json(_box().state())
+        except GatewayError as e:
+            return _json({"ok": False, "code": e.code, "detail": e.detail})
+
+
+    return mcp
