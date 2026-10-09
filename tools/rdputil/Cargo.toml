@@ -6,13 +6,17 @@ description = "Standalone RDP test client driving IronRDP (path deps into experi
 
 [dependencies]
 ironrdp = { path = "../../experiments/IronRDP-src/crates/ironrdp", features = [
-    "cliprdr", "connector", "session", "graphics", "input", "svc", "dvc", "displaycontrol",
+    "cliprdr", "connector", "session", "graphics", "input", "svc", "dvc", "displaycontrol", "rdpdr",
 ] }
 ironrdp-pdu = { path = "../../experiments/IronRDP-src/crates/ironrdp-pdu" }
 ironrdp-blocking = { path = "../../experiments/IronRDP-src/crates/ironrdp-blocking" }
 ironrdp-graphics = { path = "../../experiments/IronRDP-src/crates/ironrdp-graphics" }
+ironrdp-rdpdr = { path = "../../experiments/IronRDP-src/crates/ironrdp-rdpdr" }
+ironrdp-rdpdr-native = { path = "../../experiments/IronRDP-src/crates/ironrdp-rdpdr-native" }
+ironrdp-rdpsnd = { path = "../../experiments/IronRDP-src/crates/ironrdp-rdpsnd" }
 pico-args = "0.5"
 serde_json = "1"
+base64 = "0.22"
 x509-cert = { version = "0.3", default-features = false, features = ["std"] }
 anyhow = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }

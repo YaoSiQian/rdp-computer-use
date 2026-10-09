@@ -22,7 +22,7 @@
 use core::time::Duration;
 use std::collections::HashSet;
 use std::io::{BufRead, Write as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, TryRecvError};
 use std::time::Instant;
 
@@ -47,7 +47,7 @@ use ironrdp_pdu::WriteBuf;
 
 use crate::{
     clip_tick, connect, frame_hash, golden_text_formats, pump_until, send_input_event, send_t120_announce, AnyFramed,
-    ClipState, CommonArgs,
+    ClipState, CommonArgs, RdpdrCap, RdpdrGate, RDPDR_DRIVE_NAME,
 };
 
 const PUMP_SLICE_MS: u64 = 250;
@@ -89,6 +89,7 @@ pub(crate) struct ServeArgs {
     pub label: String,
     pub artifacts_dir: PathBuf,
     pub cliprdr: bool,
+    pub rdpdr: Option<PathBuf>,
     pub golden_rule: bool,
     pub sacrifice_first: bool,
     pub slow_input: bool,
@@ -122,6 +123,7 @@ impl ServeArgs {
                 .opt_value_from_str::<_, PathBuf>("--artifacts-dir")?
                 .unwrap_or_else(|| PathBuf::from(".")),
             cliprdr: args.contains("--cliprdr"),
+            rdpdr: args.opt_value_from_str::<_, PathBuf>("--rdpdr")?,
             golden_rule: flag(args, "--golden-rule", true)?,
             sacrifice_first: flag(args, "--sacrifice-first", false)?,
             slow_input: flag(args, "--slow-input", false)?,
@@ -145,11 +147,60 @@ struct Conn {
     activation: ConnectionActivationFactory,
 }
 
+/// The native Windows RDPDR backend only redirects logical volume roots
+/// (`X:\`), so a plain share directory is published as a SUBST drive for the
+/// daemon's lifetime and the letter is handed to the redirect backend instead.
+/// Dropped when the daemon exits, however it exits.
+struct SubstDrive {
+    letter: char,
+}
+
+impl SubstDrive {
+    fn mount(dir: &Path) -> anyhow::Result<Self> {
+        let dir = if dir.is_absolute() {
+            dir.to_path_buf()
+        } else {
+            std::fs::canonicalize(dir).context("canonicalize share dir")?
+        };
+        for letter in ('A'..='Z').rev() {
+            let root = format!("{letter}:\\");
+            if Path::new(&root).exists() {
+                continue;
+            }
+            let out = std::process::Command::new("subst")
+                .arg(format!("{letter}:"))
+                .arg(&dir)
+                .output()
+                .context("run subst")?;
+            if !out.status.success() {
+                continue;
+            }
+            if Path::new(&root).exists() {
+                return Ok(Self { letter });
+            }
+        }
+        anyhow::bail!("no free drive letter for the redirected share")
+    }
+}
+
+impl Drop for SubstDrive {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("subst").arg(format!("{}:", self.letter)).arg("/D").status();
+    }
+}
+
 struct Daemon {
     args: ServeArgs,
     common: CommonArgs,
     clip: Option<ClipState>,
     conn: Option<Conn>,
+    /// Volume-root form (`X:\`) of the redirect share, kept in sync with the
+    /// SUBST drive held in `subst`.
+    rdpdr_root: Option<PathBuf>,
+    subst: Option<SubstDrive>,
+    /// Server verdict on the drive-share announcement; None when the daemon
+    /// runs without --rdpdr.
+    rdpdr_gate: Option<RdpdrGate>,
     status: &'static str,
     connected_at: Option<Instant>,
     inputs_total: u64,
@@ -179,9 +230,18 @@ pub(crate) fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         events: Vec::new(),
     };
 
+    let subst = match args.rdpdr.as_ref() {
+        Some(dir) => Some(SubstDrive::mount(dir).context("publish redirect share as a volume root")?),
+        None => None,
+    };
+    let rdpdr_root = subst.as_ref().map(|s| PathBuf::from(format!("{}:\\", s.letter)));
+
     let mut daemon = Daemon {
         clip: None,
         conn: None,
+        rdpdr_root,
+        subst: subst,
+        rdpdr_gate: None,
         status: "connecting",
         connected_at: None,
         inputs_total: 0,
@@ -423,6 +483,8 @@ impl Daemon {
             }
             "clipboard_get" => self.op_clipboard_get(),
             "clipboard_set" => self.op_clipboard_set(p),
+            "file_push" => self.op_file_push(p),
+            "file_pull" => self.op_file_pull(p),
             "resize" => self.op_resize(p),
             "refresh" => self.op_refresh(),
             "state" => self.op_state(),
@@ -622,6 +684,62 @@ impl Daemon {
         Ok(json!({"chars": text.chars().count()}))
     }
 
+    /// file_push: write bytes into the redirected host directory; the guest
+    /// reads them through the \\tsclient\<drive> share. `name` may carry
+    /// subdirectories but never escapes the redirect root.
+    fn op_file_push(&self, p: &Value) -> SrvResult {
+        let name: String = preq_str(p, "name")?;
+        let data_b64: String = preq_str(p, "data_b64")?;
+        let data = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &data_b64)
+            .map_err(|e| serr("E_PROTO", format!("data_b64: {e}")))?;
+        let path = self.file_op_path(&name)?;
+        std::fs::create_dir_all(path.parent().unwrap_or(path.as_path())).ok();
+        std::fs::write(&path, &data).map_err(|e| serr("E_FILE", format!("write {}: {e}", path.display())))?;
+        Ok(json!({
+            "bytes": data.len(),
+            "guest_path": format!("\\\\tsclient\\{}\\{}", RDPDR_DRIVE_NAME, name.replace('/', "\\")),
+        }))
+    }
+
+    /// file_pull: read bytes the guest wrote into the redirected share.
+    fn op_file_pull(&self, p: &Value) -> SrvResult {
+        let name: String = preq_str(p, "name")?;
+        let path = self.file_op_path(&name)?;
+        let data = std::fs::read(&path).map_err(|e| serr("E_FILE", format!("read {}: {e}", path.display())))?;
+        Ok(json!({
+            "bytes": data.len(),
+            "data_b64": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &data),
+        }))
+    }
+
+    /// Resolves a relative file-op name inside the redirect root, rejecting
+    /// absolute paths, traversal, and sessions whose drive share the server
+    /// rejected.
+    fn file_op_path(&self, name: &str) -> Result<PathBuf, SrvErr> {
+        let Some(root) = self.args.rdpdr.as_ref() else {
+            return Err(serr("E_UNSUPPORTED", "file ops need the daemon started with --rdpdr <dir>"));
+        };
+        if let Some(gate) = self.rdpdr_gate.as_ref() {
+            if let RdpdrCap::Rejected(status) = gate.cap() {
+                return Err(serr(
+                    "E_UNAVAILABLE",
+                    format!("drive redirection rejected by server ({status}); guest cannot see the share"),
+                ));
+            }
+        }
+        if name.is_empty() || name.starts_with(['\\', '/']) {
+            return Err(serr("E_RANGE", "file name must be relative"));
+        }
+        let mut path = root.to_path_buf();
+        for part in name.split(['/', '\\']) {
+            if part == "." || part == ".." {
+                return Err(serr("E_RANGE", "path traversal is not allowed"));
+            }
+            path.push(part);
+        }
+        Ok(path)
+    }
+
     fn op_resize(&mut self, p: &Value) -> SrvResult {
         let w_req = pget(p, "w").unwrap_or(0);
         let h_req = pget(p, "h").unwrap_or(0);
@@ -695,6 +813,7 @@ impl Daemon {
             "reconnects": self.reconnects,
             "last_sig": self.last_sig,
             "golden_rule": self.args.golden_rule,
+            "rdpdr": self.rdpdr_gate.as_ref().map_or_else(|| "off".to_owned(), |g| g.cap().as_label()),
         }))
     }
 
@@ -773,7 +892,7 @@ impl Daemon {
     fn sacrifice(&mut self) {
         self.emit(json!({"ev": "session", "state": "sacrificing"}));
         let outcome = (|| -> anyhow::Result<()> {
-            let (cr, mut framed, _) = connect(&self.common, false)?;
+            let (cr, mut framed, _, _) = connect(&self.common, false, None)?;
             let user_channel_id = cr.user_channel_id;
             let io_channel_id = cr.io_channel_id;
             let (mut stage, _, w, h) = build_stage(cr);
@@ -793,8 +912,8 @@ impl Daemon {
     fn establish(&mut self) {
         self.status = "connecting";
         self.emit(json!({"ev": "session", "state": "connecting", "attempt": self.reconnects}));
-        match connect(&self.common, self.args.cliprdr) {
-            Ok((cr, framed, clip)) => {
+            match connect(&self.common, self.args.cliprdr, self.rdpdr_root.as_deref()) {
+            Ok((cr, framed, clip, gate)) => {
                 let user_channel_id = cr.user_channel_id;
                 let io_channel_id = cr.io_channel_id;
                 let repaint = self.reconnects > 0;
@@ -836,6 +955,7 @@ impl Daemon {
                     }
                 }
                 self.clip = clip;
+                self.rdpdr_gate = gate;
                 self.conn = Some(Conn {
                     framed,
                     stage,

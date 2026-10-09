@@ -26,7 +26,7 @@ use core::time::Duration;
 use std::io::{BufRead, Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::Context as _;
@@ -41,19 +41,145 @@ use ironrdp::connector;
 use ironrdp::connector::ConnectionResult;
 use ironrdp::connector::Sequence as _;
 use ironrdp::connector::connection_activation::{ConnectionActivationFactory, ConnectionActivationState};
-use ironrdp::svc::SvcProcessor;
+use ironrdp::svc::{SvcMessage, SvcProcessor};
 use ironrdp::pdu::gcc::{ConnectionType, KeyboardType};
 use ironrdp::pdu::input::fast_path::{FastPathInputEvent, KeyboardFlags};
 use ironrdp::pdu::input::mouse::{MousePdu, PointerFlags};
 use ironrdp::pdu::rdp::capability_sets::MajorPlatformType;
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{ActiveStage, ActiveStageBuilder, ActiveStageOutput};
+use ironrdp_rdpdr::pdu::efs::{
+    AnyIoCtlCode, DecodedDeviceControlRequest, DeviceControlRequest, DeviceIoRequest, NtStatus, PrinterIoRequest,
+    ServerDeviceAnnounceResponse, ServerDriveIoRequest,
+};
+use ironrdp_rdpdr::pdu::esc::{ScardCall, ScardIoCtlCode};
+use ironrdp_rdpdr::{RdpdrBackend, RdpdrBackendFactory, RdpdrDrive};
+use ironrdp_rdpdr_native as rdpdr_native;
+
+/// Display name of the redirected drive as the guest sees it:
+/// \\tsclient\<RDPDR_DRIVE_NAME>.
+pub(crate) const RDPDR_DRIVE_NAME: &str = "tools";
+
+/// Capability verdict for the redirected-drive share. Starts `Pending`; the
+/// server's device-announce response settles it for the session.
+#[derive(Clone, Debug, Default)]
+pub(crate) enum RdpdrCap {
+    #[default]
+    Pending,
+    Accepted,
+    /// Carries the server's NTSTATUS render.
+    Rejected(String),
+}
+
+impl RdpdrCap {
+    pub(crate) fn as_label(&self) -> String {
+        match self {
+            RdpdrCap::Pending => "pending".to_owned(),
+            RdpdrCap::Accepted => "accepted".to_owned(),
+            RdpdrCap::Rejected(status) => format!("rejected:{status}"),
+        }
+    }
+}
+
+/// Session-level rdpdr capability signal shared between the backend wrapper
+/// (wire side) and the file ops (JSON side).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RdpdrGate(Arc<Mutex<RdpdrCap>>);
+
+impl RdpdrGate {
+    fn set(&self, cap: RdpdrCap) {
+        *self.0.lock().unwrap() = cap;
+    }
+
+    pub(crate) fn cap(&self) -> RdpdrCap {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+/// Delegating backend that records the server's verdict on our device
+/// announcement. A rejected share must turn into a fast, explicit file-op
+/// failure — otherwise file_push "succeeds" while the guest never sees the
+/// file.
+#[derive(Debug)]
+struct GateBackend {
+    inner: Box<dyn RdpdrBackend>,
+    gate: RdpdrGate,
+}
+
+impl_as_any!(GateBackend);
+
+impl RdpdrBackend for GateBackend {
+    fn supports_drive_security(&self) -> bool {
+        self.inner.supports_drive_security()
+    }
+
+    fn reset(&mut self) -> PduResult<()> {
+        self.inner.reset()
+    }
+
+    fn restore_drive(&mut self, device_id: u32) -> PduResult<()> {
+        self.inner.restore_drive(device_id)
+    }
+
+    fn add_drive(&mut self, device_id: u32) -> PduResult<()> {
+        self.inner.add_drive(device_id)
+    }
+
+    fn remove_drive(&mut self, device_id: u32) -> PduResult<Vec<SvcMessage>> {
+        self.inner.remove_drive(device_id)
+    }
+
+    fn handle_server_device_announce_response(&mut self, pdu: ServerDeviceAnnounceResponse) -> PduResult<()> {
+        if pdu.result_code == NtStatus::SUCCESS {
+            self.gate.set(RdpdrCap::Accepted);
+        } else {
+            self.gate.set(RdpdrCap::Rejected(format!("{:?}", pdu.result_code)));
+        }
+        self.inner.handle_server_device_announce_response(pdu)
+    }
+
+    fn handle_scard_call(
+        &mut self,
+        req: DeviceControlRequest<ScardIoCtlCode>,
+        call: ScardCall,
+    ) -> PduResult<Vec<SvcMessage>> {
+        self.inner.handle_scard_call(req, call)
+    }
+
+    fn handle_drive_io_request(&mut self, req: ServerDriveIoRequest) -> PduResult<Vec<SvcMessage>> {
+        self.inner.handle_drive_io_request(req)
+    }
+
+    fn handle_drive_device_control(
+        &mut self,
+        req: DecodedDeviceControlRequest<AnyIoCtlCode>,
+    ) -> PduResult<Vec<SvcMessage>> {
+        self.inner.handle_drive_device_control(req)
+    }
+
+    fn poll_deferred_messages(&mut self) -> PduResult<Vec<SvcMessage>> {
+        self.inner.poll_deferred_messages()
+    }
+
+    fn handle_user_logged_on(&mut self, rdpdr: &mut ironrdp::rdpdr::Rdpdr) -> PduResult<Vec<SvcMessage>> {
+        self.inner.handle_user_logged_on(rdpdr)
+    }
+
+    fn handle_printer_io_request(&mut self, req: PrinterIoRequest) -> PduResult<Vec<SvcMessage>> {
+        self.inner.handle_printer_io_request(req)
+    }
+
+    fn reject_printer_write(&mut self, req: DeviceIoRequest) -> PduResult<Vec<SvcMessage>> {
+        self.inner.reject_printer_write(req)
+    }
+}
 use ironrdp_pdu::input::{InputEvent, InputEventPdu, ScanCodePdu, UnicodePdu};
 use ironrdp_pdu::rdp::client_info::{CompressionType, PerformanceFlags, TimezoneInfo};
 use ironrdp_pdu::geometry::InclusiveRectangle;
 use ironrdp_pdu::rdp::headers::ShareDataPdu;
 use ironrdp_pdu::rdp::refresh_rectangle::RefreshRectanglePdu;
 use ironrdp_pdu::WriteBuf;
+use ironrdp_pdu::{impl_as_any, PduResult};
 use sspi::network_client::reqwest_network_client::ReqwestNetworkClient;
 use tokio_rustls::rustls;
 use tracing::{debug, info, trace, warn};
@@ -402,7 +528,7 @@ fn run(command: Command) -> anyhow::Result<()> {
         "run"
     );
 
-    let (connection_result, framed, _) = connect(&common, false).context("connect")?;
+    let (connection_result, framed, _, _) = connect(&common, false, None).context("connect")?;
     info!(compression_type = ?connection_result.compression_type, "Negotiated compression");
 
     let mut image = DecodedImage::new(
@@ -433,7 +559,8 @@ fn run(command: Command) -> anyhow::Result<()> {
 pub(crate) fn connect(
     common: &CommonArgs,
     cliprdr: bool,
-) -> anyhow::Result<(ConnectionResult, AnyFramed, Option<ClipState>)> {
+    rdpdr: Option<&std::path::Path>,
+) -> anyhow::Result<(ConnectionResult, AnyFramed, Option<ClipState>, Option<RdpdrGate>)> {
     const MAX_ATTEMPTS: usize = 3;
 
     let mut last_error = None;
@@ -447,7 +574,7 @@ pub(crate) fn connect(
             common.compression_level,
         )?;
 
-        match connect_once(connector_config, &common.host, common.port, cliprdr) {
+        match connect_once(connector_config, &common.host, common.port, cliprdr, rdpdr) {
             Ok(result) => return Ok(result),
             Err(error) => {
                 warn!(attempt, MAX_ATTEMPTS, error = %error.root_cause(), "Connection attempt failed");
@@ -467,7 +594,17 @@ fn connect_once(
     server_name: &str,
     port: u16,
     cliprdr: bool,
-) -> anyhow::Result<(ConnectionResult, AnyFramed, Option<ClipState>)> {
+    rdpdr: Option<&std::path::Path>,
+) -> anyhow::Result<(ConnectionResult, AnyFramed, Option<ClipState>, Option<RdpdrGate>)> {
+    // Windows couples rdpdr initialization to audio support: with
+    // INFO_NOAUDIOPLAYBACK set in the Client Info PDU the server never starts
+    // the rdpdr handshake, no matter that the RDPSND static channel is
+    // advertised. Claim audio playback whenever drive redirection is on; the
+    // Noop RDPSND backend keeps that path silent.
+    let mut config = config;
+    if rdpdr.is_some() {
+        config.enable_audio_playback = true;
+    }
     let server_addr = lookup_addr(server_name, port).context("lookup addr")?;
 
     info!(%server_addr, "Looked up server address");
@@ -532,6 +669,34 @@ fn connect_once(
         None
     };
 
+    // Drive redirection (rdpdr): expose a host directory to the guest as a
+    // \\tsclient\<name> share for the file_push/file_pull ops. The backend
+    // owns per-session device state, so a fresh one is built per connection
+    // attempt, which keeps reconnects consistent.
+    let mut rdpdr_gate: Option<RdpdrGate> = None;
+    if let Some(dir) = rdpdr {
+        // Windows servers only issue RDPDR traffic when RDPSND is also
+        // advertised; a silent RDPSND channel keeps the redirect alive.
+        connector = connector.with_static_channel(ironrdp_rdpsnd::client::Rdpsnd::new(
+            Box::new(ironrdp_rdpsnd::client::NoopRdpsndBackend),
+        ));
+        let drive =
+            rdpdr_native::RedirectedDrive::new(42, RDPDR_DRIVE_NAME, dir, false).context("redirected drive definition")?;
+        let factory = rdpdr_native::WindowsRdpdrBackendFactory::from_drives(vec![drive]).context("rdpdr backend factory")?;
+        let product = factory
+            .build_rdpdr_backend()
+            .map_err(|e| anyhow::anyhow!("rdpdr backend build: {e}"))?;
+        let (backend, drives) = product.into_parts();
+        let drives = drives.into_iter().map(RdpdrDrive::into_parts).collect::<Vec<_>>();
+        // Watch the server's announce verdict so file ops can fail fast when
+        // the share never becomes visible to the guest.
+        let gate = RdpdrGate::default();
+        let backend = GateBackend { inner: backend, gate: gate.clone() };
+        connector = connector
+            .with_static_channel(ironrdp::rdpdr::Rdpdr::new(Box::new(backend), "rdputil".to_owned()).with_drives(Some(drives)));
+        rdpdr_gate = Some(gate);
+    }
+
     // Dynamic display control (RDPUTIL_DISP=1): host the Display Control DVC
     // behind DRDYNVC so the drive-mode `resize W H` command can change the
     // guest resolution on the fly (MS-RDPEDISP). Attach before connect_begin
@@ -572,7 +737,13 @@ fn connect_once(
     )
     .context("finalize connection")?;
 
-    Ok((connection_result, framed, clip))
+    eprintln!(
+        "SERVE channels rdpdr={:?} rdpsnd={:?}",
+        connection_result.static_channels.get_channel_id_by_type::<ironrdp::rdpdr::Rdpdr>(),
+        connection_result.static_channels.get_channel_id_by_type::<ironrdp_rdpsnd::client::Rdpsnd>(),
+    );
+
+    Ok((connection_result, framed, clip, rdpdr_gate))
 }
 
 /// Replays the mstsc MS_T120 static-channel announce on the I/O channel.
@@ -914,7 +1085,7 @@ fn run_drive(common: &CommonArgs, image: &mut DecodedImage) -> anyhow::Result<()
     let mut round = 0u32;
     loop {
         round += 1;
-        let (connection_result, mut framed, clip) = match connect(common, cliprdr_enabled) {
+        let (connection_result, mut framed, clip, _) = match connect(common, cliprdr_enabled, None) {
             Ok(ok) => ok,
             Err(e) => {
                 if !reconnect {
@@ -1637,7 +1808,32 @@ pub(crate) fn pump_until(
                 _ => {}
             }
         }
+
+        // rdpdr backends complete file IO on worker threads; their responses
+        // leave the processor only when polled. Drain them every slice so
+        // guest file operations never stall between pump iterations.
+        poll_rdpdr(framed, active_stage)?;
     }
+}
+
+/// Drains deferred rdpdr responses (backend worker threads answering file IO)
+/// and sends them on the wire. No-op unless the rdpdr channel is registered.
+fn poll_rdpdr(framed: &mut AnyFramed, active_stage: &mut ActiveStage) -> anyhow::Result<()> {
+    let (name, msgs) = {
+        let Some(actor) = active_stage.get_svc_processor_mut::<ironrdp::rdpdr::Rdpdr>() else {
+            return Ok(());
+        };
+        let name = actor.channel_name();
+        let msgs = actor.poll_deferred_messages()?;
+        (name, msgs)
+    };
+    if msgs.is_empty() {
+        return Ok(());
+    }
+    eprintln!("RDPDRTX count={}", msgs.len());
+    let frame = active_stage.process_svc_messages_by_name(&name, msgs.into())?;
+    framed.write_all(frame.as_slice()).context("write rdpdr response")?;
+    Ok(())
 }
 
 /// Drives the Deactivation-Reactivation Sequence inline (MS-RDPBCGR 1.3.1.3):
