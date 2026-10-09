@@ -161,14 +161,26 @@ def case_w7_desktop_menu_esc(box) -> str:
 
 
 def case_xp_type_burst(box) -> str:
-    """KNOWN DEATH RISK on the xp profile: long type bursts may raise the
-    input_violation death signature (unicode partial-implementation).
+    """EXPECTED-RED annotation under test on the xp profile: input-bearing
+    sessions get kicked ~14-20s after the first input (terminate + RST), so
+    a long type burst should end in the documented death signature.
 
     Default-skipped: the xp profile stays gated off until the burst probe
-    passes; enabling this case (--with-disabled) is the probe.
+    passes; enabling this case (--with-disabled) is the probe. A session
+    still answerable after the kick window raises Drift — the annotation is
+    stale on the current surface.
     """
     box.type_text("regression burst " * 40, mode="text")
-    return "burst accepted"
+    deadline = time.time() + 25
+    while time.time() < deadline:
+        if getattr(box.session, "status", "") in ("dead", "closed"):
+            return f"death signature confirmed ({box.session.status})"
+        time.sleep(1.0)
+    try:
+        box.screenshot()
+    except GatewayError:
+        return "death signature confirmed (session unanswerable)"
+    raise Drift("session answerable 25s after burst; kick did not reproduce")
 
 
 CASES: list[Case] = [
