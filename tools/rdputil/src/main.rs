@@ -2033,7 +2033,18 @@ fn build_config(
             height: std::env::var("RDPUTIL_H").ok().and_then(|v| v.parse().ok()).unwrap_or(1024),
         },
         monitor_layout: None,
-        bitmap: None,
+        // RDPUTIL_BPP=<15|16|24>: request a legacy session color depth. The
+        // default is 32 bpp; servers predating RDP 6.0 may not paint at all
+        // against that request. An empty codec list keeps basic bitmap
+        // updates (no surface commands).
+        bitmap: std::env::var("RDPUTIL_BPP")
+            .ok()
+            .and_then(|bpp| bpp.parse::<u32>().ok())
+            .map(|color_depth| connector::BitmapConfig {
+                lossy_compression: false,
+                color_depth,
+                codecs: ironrdp_pdu::rdp::capability_sets::BitmapCodecs(Vec::new()),
+            }),
         client_build: 0,
         client_name: "rdputil".to_owned(),
         client_dir: "C:\\Windows\\System32\\mstscax.dll".to_owned(),
