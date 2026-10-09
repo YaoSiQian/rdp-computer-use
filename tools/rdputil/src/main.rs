@@ -47,7 +47,7 @@ use ironrdp::pdu::input::fast_path::{FastPathInputEvent, KeyboardFlags};
 use ironrdp::pdu::input::mouse::{MousePdu, PointerFlags};
 use ironrdp::pdu::rdp::capability_sets::MajorPlatformType;
 use ironrdp::session::image::DecodedImage;
-use ironrdp::session::{ActiveStage, ActiveStageBuilder, ActiveStageOutput};
+use ironrdp::session::{ActiveStage, ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason};
 use ironrdp_rdpdr::pdu::efs::{
     AnyIoCtlCode, DecodedDeviceControlRequest, DeviceControlRequest, DeviceIoRequest, NtStatus, PrinterIoRequest,
     ServerDeviceAnnounceResponse, ServerDriveIoRequest,
@@ -174,6 +174,8 @@ impl RdpdrBackend for GateBackend {
     }
 }
 use ironrdp_pdu::input::{InputEvent, InputEventPdu, ScanCodePdu, UnicodePdu};
+use ironrdp_pdu::mcs::{DisconnectProviderUltimatum, DisconnectReason, McsMessage};
+use ironrdp_pdu::x224::X224;
 use ironrdp_pdu::rdp::client_info::{CompressionType, PerformanceFlags, TimezoneInfo};
 use ironrdp_pdu::geometry::InclusiveRectangle;
 use ironrdp_pdu::rdp::headers::ShareDataPdu;
@@ -1706,7 +1708,12 @@ fn drive_loop(
                             pump_until(framed, active_stage, image, Instant::now() + Duration::from_millis(250), Some(activation))?;
                         }
                     }
-                    ["q"] => anyhow::bail!("__quit__"),
+                    ["q"] => {
+                        // Graceful hang-up: without the ultimatum the server waits
+                        // out a transport timeout before releasing the session.
+                        let _ = send_goodbye(framed);
+                        anyhow::bail!("__quit__")
+                    }
                     _ => anyhow::bail!("unknown command"),
                 }
             })();
@@ -1793,6 +1800,23 @@ pub(crate) fn pump_until(
                     // Terminate. Treating that as a real shutdown ended the session
                     // ~15 ms after activation (before a single bitmap arrived).
                     // Keep pumping; a genuine disconnect shows up as a socket error.
+                    //
+                    // A genuine disconnect is exactly what the ultimatum-based
+                    // reasons are: the server hangs up right after, so acknowledge
+                    // it with our own ultimatum (the [MS-RDPBCGR] graceful
+                    // disconnect handshake). Skipping the reply leaves the server
+                    // WinStation in its disconnect-transition state until a
+                    // transport timeout expires, during which reconnect attempts
+                    // are rejected with a "terminal is busy" error.
+                    if matches!(
+                        reason,
+                        GracefulDisconnectReason::UserInitiated | GracefulDisconnectReason::ServerInitiated
+                    ) {
+                        match send_goodbye(framed) {
+                            Ok(()) => info!("GOODBYE sent"),
+                            Err(e) => warn!(error = %format!("{e:#}"), "GOODBYE failed"),
+                        }
+                    }
                     warn!(?reason, "Server requested terminate; ignoring and continuing");
                     continue 'pump;
                 }
@@ -1800,12 +1824,16 @@ pub(crate) fn pump_until(
                     // Deactivation-Reactivation Sequence (MS-RDPBCGR 1.3.1.3):
                     // after a display-control Monitor Layout request the server
                     // deactivates the share and re-runs activation, carrying the
-                    // NEW desktop size in its Demand Active PDU.
+                    // NEW desktop size in its Demand Active PDU. Some servers skip
+                    // the Deactivate-All and just re-send the Demand Active PDU
+                    // mid-session; the session layer intercepts that and surfaces
+                    // it as DeactivateAll with the frame stashed for pickup.
                     let Some(factory) = activation else {
                         eprintln!("DEACTIVATE ignored (no activation factory; drive mode only)");
                         continue 'pump;
                     };
-                    run_reactivation(framed, active_stage, image, factory)?;
+                    let preseed = active_stage.take_pending_demand_active();
+                    run_reactivation(framed, active_stage, image, factory, preseed)?;
                 }
                 ActiveStageOutput::AutoReconnectCookie(cookie) => {
                     if let Ok(path) = std::env::var("RDPUTIL_COOKIE_OUT") {
@@ -1851,18 +1879,38 @@ fn poll_rdpdr(framed: &mut AnyFramed, active_stage: &mut ActiveStage) -> anyhow:
     Ok(())
 }
 
+/// Sends the MCS Disconnect Provider Ultimatum that hangs up a session the
+/// way the protocol's graceful disconnect is defined. The server releases the
+/// WinStation as soon as it arrives; an abrupt socket close instead leaves the
+/// terminal in its disconnect-transition state for a long while, during which
+/// reconnect attempts are rejected as busy.
+fn send_goodbye(framed: &mut AnyFramed) -> anyhow::Result<()> {
+    let pdu = X224(McsMessage::DisconnectProviderUltimatum(
+        DisconnectProviderUltimatum::from_reason(DisconnectReason::UserRequested),
+    ));
+    let mut buf = vec![0u8; ironrdp_pdu::Encode::size(&pdu)];
+    let mut cur = ironrdp_pdu::cursor::WriteCursor::new(&mut buf);
+    ironrdp_pdu::Encode::encode(&pdu, &mut cur).map_err(|e| anyhow::anyhow!("encode goodbye: {e}"))?;
+    framed.write_all(&buf).context("write goodbye")
+}
+
 /// Drives the Deactivation-Reactivation Sequence inline (MS-RDPBCGR 1.3.1.3):
 /// steps the activation sequence over the raw wire — Sync/Cooperate/Font List/
 /// Font List PDU — until Finalized, then rebuilds the fast-path processor with
 /// the new share_id and the framebuffer with the new desktop size. The Display
 /// Control DVC lives on the DRDYNVC static channel and survives deactivation.
+///
+/// `preseed` is an already-received Demand Active PDU frame (decrypted, its
+/// receive cipher stream already advanced) to feed to the fresh sequence before
+/// reading further frames from the wire.
 fn run_reactivation(
     framed: &mut AnyFramed,
     active_stage: &mut ActiveStage,
     image: &mut DecodedImage,
     factory: &ConnectionActivationFactory,
+    mut preseed: Option<Vec<u8>>,
 ) -> anyhow::Result<()> {
-    eprintln!("DEACTIVATE reactivation begin");
+    eprintln!("DEACTIVATE reactivation begin preseed={}", preseed.is_some());
     framed.get_inner_mut().0.set_read_timeout(Some(Duration::from_secs(5)))?;
     let mut seq = factory.create();
     let mut buf = WriteBuf::new();
@@ -1875,22 +1923,27 @@ fn run_reactivation(
             // advance the receive cipher stream or all later decryptions
             // desync. read_by_hint alone would hand the sequence raw
             // ciphertext, so decrypt through the stage first.
-            let (action, payload) = loop {
-                match framed.read_pdu() {
-                    Ok(ok) => break ok,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
-                    Err(e) => return Err(anyhow::Error::new(e).context("read reactivation frame")),
+            let payload = if let Some(frame) = preseed.take() {
+                frame
+            } else {
+                let (action, payload) = loop {
+                    match framed.read_pdu() {
+                        Ok(ok) => break ok,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
+                        Err(e) => return Err(anyhow::Error::new(e).context("read reactivation frame")),
+                    }
+                };
+                let payload = active_stage
+                    .decrypt_inbound_frame(action, &payload)
+                    .map_err(|e| anyhow::Error::new(e).context("decrypt reactivation frame"))?;
+                if !matches!(action, ironrdp_pdu::Action::X224) {
+                    // Graphics/pointer update mid-reactivation: the cipher stream
+                    // stays in sync, the PDU itself is not part of the sequence.
+                    continue;
                 }
+                payload.into_owned()
             };
-            let payload = active_stage
-                .decrypt_inbound_frame(action, &payload)
-                .map_err(|e| anyhow::Error::new(e).context("decrypt reactivation frame"))?;
-            if !matches!(action, ironrdp_pdu::Action::X224) {
-                // Graphics/pointer update mid-reactivation: the cipher stream
-                // stays in sync, the PDU itself is not part of the sequence.
-                continue;
-            }
             seq.step(&payload, framed.last_read_at(), &mut buf)?
         } else {
             seq.step_no_input(&mut buf)?
@@ -2015,6 +2068,12 @@ fn build_config(
     // RDPUTIL_SSL=1: TLS-only transport, no CredSSP/NLA. Credentials ride in
     // the Client Info PDU. Needed against servers whose CredSSP branch hangs.
     let ssl_only = std::env::var("RDPUTIL_SSL").as_deref() == Ok("1");
+    // RDPUTIL_LEGACY_CLIENT=1: advertise a Client Info PDU indistinguishable
+    // from a Windows 2000/XP-era client — the compact RDP 5.x flag set (no
+    // LOGON_NOTIFY / LOGON_ERRORS / MOUSE_HAS_WHEEL / NO_AUDIO_PLAYBACK) and
+    // a clientBuild of 2600. Legacy winlogon copies these fields into the
+    // WINSTATIONCLIENT structure it consults when starting the user desktop.
+    let legacy_client = std::env::var("RDPUTIL_LEGACY_CLIENT").as_deref() == Ok("1");
     Ok(connector::Config {
         credentials: Credentials::UsernamePassword { username, password },
         domain,
@@ -2045,7 +2104,7 @@ fn build_config(
                 color_depth,
                 codecs: ironrdp_pdu::rdp::capability_sets::BitmapCodecs(Vec::new()),
             }),
-        client_build: 0,
+        client_build: if legacy_client { 2600 } else { 0 },
         client_name: "rdputil".to_owned(),
         client_dir: "C:\\Windows\\System32\\mstscax.dll".to_owned(),
 
@@ -2079,6 +2138,7 @@ fn build_config(
         pointer_software_rendering: true,
         multitransport_flags: None,
         support_dyn_vc_gfx_protocol: false,
+        legacy_info_flags: legacy_client,
         performance_flags: PerformanceFlags::default(),
         desktop_scale_factor: 0,
         hardware_id: None,
