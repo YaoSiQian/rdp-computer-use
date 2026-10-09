@@ -1,28 +1,31 @@
 {
   "profiles": {
-    "win10": {
+    "w10": {
       "host": "HOST_OR_IP",
       "username": "USER",
-      "password_env": "GATEWAY_WIN10_PASS",
+      "password_env": "GATEWAY_W10_PASS",
       "rdpdr": true
     },
-    "win7": {
+    "w7": {
       "host": "HOST_OR_IP",
       "username": "USER",
-      "password_env": "GATEWAY_WIN7_PASS",
+      "password_env": "GATEWAY_W7_PASS",
       "rdpdr": false
     },
-    "winxp": {
+    "xp": {
       "host": "HOST_OR_IP",
       "username": "USER",
-      "password_env": "GATEWAY_WINXP_PASS",
+      "password_env": "GATEWAY_XP_PASS",
       "rdpdr": false
     },
-    "ubuntu-xrdp": {
+    "u22": {
       "host": "HOST_OR_IP",
       "username": "USER",
-      "password_env": "GATEWAY_UBUNTU_PASS",
-      "rdpdr": false
+      "password_env": "GATEWAY_U22_PASS",
+      "engine": "oneshot",
+      "desktop_size": [1024, 768],
+      "retry_attempts": 3,
+      "retry_interval_s": 15.0
     }
   }
 }
