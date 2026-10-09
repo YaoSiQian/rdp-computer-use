@@ -62,6 +62,7 @@ class RdpSession:
         run_dir: str | Path | None = None,
         golden_rule: bool = True,
         cliprdr: bool = True,
+        rdpdr: bool = False,
         extra_args: list[str] | None = None,
     ):
         self.name = name
@@ -75,6 +76,7 @@ class RdpSession:
         self.artifacts_dir.mkdir(exist_ok=True)
         self.golden_rule = golden_rule
         self.cliprdr = cliprdr
+        self.rdpdr = rdpdr
         self.extra_args = extra_args or []
 
         self.desktop: dict | None = None
@@ -106,6 +108,10 @@ class RdpSession:
             *(["--cliprdr"] if self.cliprdr else []),
             *(self.extra_args),
         ]
+        if self.rdpdr:
+            redirect_root = self.run_dir / "redirect"
+            redirect_root.mkdir(exist_ok=True)
+            argv += ["--rdpdr", str(redirect_root)]
         env = {**os.environ, "RDPUTIL_PASS": self.password}
         if self.cliprdr:
             env["RDPUTIL_CLIPRDR"] = "1"

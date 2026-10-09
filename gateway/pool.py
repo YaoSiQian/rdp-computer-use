@@ -6,9 +6,13 @@ environment). Schema:
 
     {
       "win10": {"host": "<host>", "username": "<user>",
-                "password_env": "GATEWAY_WIN10_PASS"},
+                "password_env": "GATEWAY_WIN10_PASS", "rdpdr": true},
       ...
     }
+
+`rdpdr` (optional, default false) starts the daemon with drive redirection
+and enables the file_push/file_pull tools; servers that reject the redirect
+surface that as an E_UNAVAILABLE error at call time.
 
 `profiles.sample.json` in this directory shows the schema with placeholder
 values. A single RDP session per target is enforced: asking for the same name
@@ -73,6 +77,7 @@ class SessionPool:
                 daemon_path=self.daemon_path or prof.get("daemon"),
                 run_dir=self.run_root / f"{prof.get('run_prefix', '')}{name}",
                 golden_rule=golden_rule,
+                rdpdr=bool(prof.get("rdpdr", False)),
             )
             session.start()
             session.wait_connected()

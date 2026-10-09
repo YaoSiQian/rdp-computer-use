@@ -1,8 +1,28 @@
 {
   "profiles": {
-    "win10":       {"host": "HOST_OR_IP", "username": "USER", "password_env": "GATEWAY_WIN10_PASS"},
-    "win7":        {"host": "HOST_OR_IP", "username": "USER", "password_env": "GATEWAY_WIN7_PASS"},
-    "winxp":       {"host": "HOST_OR_IP", "username": "USER", "password_env": "GATEWAY_WINXP_PASS"},
-    "ubuntu-xrdp": {"host": "HOST_OR_IP", "username": "USER", "password_env": "GATEWAY_UBUNTU_PASS"}
+    "win10": {
+      "host": "HOST_OR_IP",
+      "username": "USER",
+      "password_env": "GATEWAY_WIN10_PASS",
+      "rdpdr": true
+    },
+    "win7": {
+      "host": "HOST_OR_IP",
+      "username": "USER",
+      "password_env": "GATEWAY_WIN7_PASS",
+      "rdpdr": false
+    },
+    "winxp": {
+      "host": "HOST_OR_IP",
+      "username": "USER",
+      "password_env": "GATEWAY_WINXP_PASS",
+      "rdpdr": false
+    },
+    "ubuntu-xrdp": {
+      "host": "HOST_OR_IP",
+      "username": "USER",
+      "password_env": "GATEWAY_UBUNTU_PASS",
+      "rdpdr": false
+    }
   }
 }

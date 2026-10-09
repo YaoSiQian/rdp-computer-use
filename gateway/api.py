@@ -9,6 +9,9 @@ about what it sees and where it clicks.
 
 from __future__ import annotations
 
+import base64
+from pathlib import Path
+
 from .observe import observe, to_native
 from .session import GatewayError, RdpSession
 
@@ -86,10 +89,26 @@ class ToolBox:
     # ------------------------------------------------------------------ files
 
     def file_push(self, local_path: str, guest_name: str | None = None) -> dict:
-        raise GatewayError("E_UNSUPPORTED", "file_push arrives with the rdpdr milestone (M3)")
+        """Copy a host file into the redirected drive share; the guest reads
+        it at \\\\tsclient\\tools\\<guest_name>. Requires a profile with
+        rdpdr enabled and a server that accepts the redirect (otherwise the
+        daemon answers E_UNAVAILABLE / E_UNSUPPORTED)."""
+        src = Path(local_path)
+        name = guest_name or src.name
+        data = src.read_bytes()
+        return self.session.call(
+            "file_push",
+            {"name": name, "data_b64": base64.b64encode(data).decode("ascii")},
+            timeout=300,
+        )
 
-    def file_pull(self, guest_path: str) -> dict:
-        raise GatewayError("E_UNSUPPORTED", "file_pull arrives with the rdpdr milestone (M3)")
+    def file_pull(self, guest_path: str, local_path: str | None = None) -> dict:
+        """Read a file out of the redirected drive share (guest-side writes
+        land there) and store it on the host next to the session evidence."""
+        r = self.session.call("file_pull", {"name": guest_path}, timeout=300)
+        dest = Path(local_path) if local_path else self.session.artifacts_dir / Path(guest_path).name
+        dest.write_bytes(base64.b64decode(r.get("data_b64", "")))
+        return {"ok": True, "guest_path": guest_path, "local_path": str(dest), "bytes": r.get("bytes")}
 
     # ------------------------------------------------------------------ helpers
 

@@ -111,6 +111,26 @@ def create_mcp(pool: SessionPool, profile: str) -> FastMCP:
 
 
     @mcp.tool()
+    async def file_push(local_path: str, guest_name: str | None = None) -> str:
+        """Copy a host file into the redirected drive share; the guest reads
+        it at \\\\tsclient\\tools\\<guest_name>."""
+        try:
+            return _json(_box().file_push(local_path, guest_name))
+        except GatewayError as e:
+            return _json({"ok": False, "code": e.code, "detail": e.detail})
+
+
+    @mcp.tool()
+    async def file_pull(guest_path: str, local_path: str | None = None) -> str:
+        """Read a file out of the redirected drive share and store it on the
+        host next to the session evidence."""
+        try:
+            return _json(_box().file_pull(guest_path, local_path))
+        except GatewayError as e:
+            return _json({"ok": False, "code": e.code, "detail": e.detail})
+
+
+    @mcp.tool()
     async def state() -> str:
         """Session state: uptime, input counters, last death signature."""
         try:

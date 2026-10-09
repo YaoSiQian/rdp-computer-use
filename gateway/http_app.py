@@ -95,6 +95,16 @@ def create_app(pool: SessionPool) -> FastAPI:
         p = await _body(req)
         return _run(name, lambda: _box(name).resize(int(p.get("w", 1280)), int(p.get("h", 1024))))
 
+    @app.post("/vm/{name}/file_push")
+    async def file_push(name: str, req: Request) -> dict:
+        p = await _body(req)
+        return _run(name, lambda: _box(name).file_push(str(p.get("local_path", "")), p.get("guest_name")))
+
+    @app.post("/vm/{name}/file_pull")
+    async def file_pull(name: str, req: Request) -> dict:
+        p = await _body(req)
+        return _run(name, lambda: _box(name).file_pull(str(p.get("guest_path", "")), p.get("local_path")))
+
     @app.get("/vm/{name}/state")
     def state(name: str) -> dict:
         return _run(name, lambda: _box(name).state())
