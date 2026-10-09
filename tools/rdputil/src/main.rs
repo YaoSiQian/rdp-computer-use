@@ -205,6 +205,8 @@ COMMANDS:
       [--seq <TOKENS>]                mixed event sequence, comma separated:
                                         k<0xNN>  key tap (press + release)
                                         ke<0xNN> extended key tap (E0-prefixed, e.g. ke0x5b = Win)
+                                        d<0xNN> / u<0xNN>   key down / key up
+                                        de<0xNN> / ue<0xNN> extended key down / up (for chords)
                                         c<x>-<y> left click at (x, y)
                                         r<x>-<y> right click at (x, y)
                                       e.g. --seq ke0x5b,c600-644,k0x02,k0x1c
@@ -433,6 +435,19 @@ fn parse_seq_events(seq: &str) -> anyhow::Result<Vec<(FastPathInputEvent, u64)>>
             events.push((FastPathInputEvent::KeyboardEvent(KeyboardFlags::empty(), scancode), pending_wait_ms));
             events.push((FastPathInputEvent::KeyboardEvent(KeyboardFlags::RELEASE, scancode), 0));
             pending_wait_ms = 0;
+        } else if let Some(rest) = token.strip_prefix("de") {
+            let scancode = u8::from_str_radix(rest.trim_start_matches("0x"), 16)
+                .context("--seq extended key-down token must be a hex byte (e.g. de0x5b)")?;
+            events.push((FastPathInputEvent::KeyboardEvent(KeyboardFlags::EXTENDED, scancode), pending_wait_ms));
+            pending_wait_ms = 0;
+        } else if let Some(rest) = token.strip_prefix("ue") {
+            let scancode = u8::from_str_radix(rest.trim_start_matches("0x"), 16)
+                .context("--seq extended key-up token must be a hex byte (e.g. ue0x5b)")?;
+            events.push((
+                FastPathInputEvent::KeyboardEvent(KeyboardFlags::EXTENDED | KeyboardFlags::RELEASE, scancode),
+                pending_wait_ms,
+            ));
+            pending_wait_ms = 0;
         } else if let Some(rest) = token.strip_prefix('d') {
             let scancode = u8::from_str_radix(rest.trim_start_matches("0x"), 16)
                 .context("--seq key-down token must be a hex byte (e.g. d0x1d)")?;
@@ -479,7 +494,7 @@ fn parse_seq_events(seq: &str) -> anyhow::Result<Vec<(FastPathInputEvent, u64)>>
             events.push((pdu(PointerFlags::RIGHT_BUTTON), 0));
             pending_wait_ms = 0;
         } else {
-            anyhow::bail!("unknown --seq token '{token}': expected k<0xNN>, ke<0xNN>, c<x>-<y>, r<x>-<y> or w<ms>");
+            anyhow::bail!("unknown --seq token '{token}': expected k<0xNN>, ke<0xNN>, d/u<0xNN>, de/ue<0xNN>, c<x>-<y>, r<x>-<y> or w<ms>");
         }
     }
 
