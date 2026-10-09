@@ -126,6 +126,11 @@ def case_w7_desktop_menu_esc(box) -> str:
     real, verifies the documented death signature after Esc — and raises
     Drift when the session survives instead, flagging the annotation as
     stale on the current surface rather than silently passing it.
+
+    Re-verified 2026-10-09 on an interactive desktop: the sequence survives
+    on both engines (serve: clean survival; drive: SETERR + channel
+    deactivation that reactivates, no ultimatum). The annotation stays until
+    the death is re-confirmed or the annotation is formally retired.
     """
     st = box.state()
     desktop = box.session.desktop or (st.get("desktop") or {})
