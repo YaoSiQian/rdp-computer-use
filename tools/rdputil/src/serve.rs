@@ -150,13 +150,45 @@ struct Conn {
 /// The native Windows RDPDR backend only redirects logical volume roots
 /// (`X:\`), so a plain share directory is published as a SUBST drive for the
 /// daemon's lifetime and the letter is handed to the redirect backend instead.
-/// Dropped when the daemon exits, however it exits.
+/// Dropped on normal daemon exit; mappings left behind by a killed daemon are
+/// reclaimed by the stale sweep on the next mount.
 struct SubstDrive {
     letter: char,
 }
 
 impl SubstDrive {
+    /// Remove SUBST mappings whose target path no longer exists. Those are
+    /// remains of terminated daemons — the Drop cleanup does not run when the
+    /// process is killed — and a dead mapping only serves to pin the letter.
+    fn sweep_stale() {
+        let out = match std::process::Command::new("subst").output() {
+            Ok(out) => out,
+            Err(_) => return, // subst unavailable; nothing to reclaim
+        };
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            // "Z:\: => C:\some\dir"
+            let Some((mapped, target)) = line.split_once(" => ") else {
+                continue;
+            };
+            let mut chars = mapped.chars();
+            let (Some(letter), Some(':'), Some('\\'), Some(':')) =
+                (chars.next(), chars.next(), chars.next(), chars.next())
+            else {
+                continue;
+            };
+            if Path::new(target).exists() {
+                continue;
+            }
+            let _ = std::process::Command::new("subst")
+                .arg(format!("{letter}:"))
+                .arg("/D")
+                .status();
+        }
+    }
+
     fn mount(dir: &Path) -> anyhow::Result<Self> {
+        Self::sweep_stale();
         let dir = if dir.is_absolute() {
             dir.to_path_buf()
         } else {
