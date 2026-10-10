@@ -151,6 +151,10 @@ class OneShotSession:
     def start(self) -> None:
         self.evidence("session_start", {"host": self.host, "user": self.username, "engine": "oneshot"})
 
+    @property
+    def dead(self) -> bool:
+        return self.status == "closed"
+
     def close(self) -> None:
         self.status = "closed"
         self.evidence("session_close", {"orphans_reaped": self.orphans_reaped})

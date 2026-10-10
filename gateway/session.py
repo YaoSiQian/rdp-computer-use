@@ -64,6 +64,7 @@ class RdpSession:
         cliprdr: bool = True,
         rdpdr: bool = False,
         extra_args: list[str] | None = None,
+        remote_app: dict | None = None,
     ):
         self.name = name
         self.host = host
@@ -78,6 +79,10 @@ class RdpSession:
         self.cliprdr = cliprdr
         self.rdpdr = rdpdr
         self.extra_args = extra_args or []
+        # RemoteApp (RAIL) launch request: {"app", "args"?, "workdir"?}. When
+        # set, the daemon connects in RemoteApp mode and the session's lifetime
+        # is the app's lifetime — the server closes it when the app exits.
+        self.remote_app = remote_app
 
         self.desktop: dict | None = None
         self.status = "starting"
@@ -115,6 +120,12 @@ class RdpSession:
         env = {**os.environ, "RDPUTIL_PASS": self.password}
         if self.cliprdr:
             env["RDPUTIL_CLIPRDR"] = "1"
+        if self.remote_app:
+            env["RDPUTIL_REMOTE_APP"] = str(self.remote_app["app"])
+            if self.remote_app.get("args"):
+                env["RDPUTIL_REMOTE_APP_ARGS"] = str(self.remote_app["args"])
+            if self.remote_app.get("workdir"):
+                env["RDPUTIL_REMOTE_APP_WORKDIR"] = str(self.remote_app["workdir"])
         # Daemon tracing (connection ladder, cliprdr wire events) is the
         # primary diagnostic surface — keep it next to the artifacts.
         self._stderr_file = open(self.artifacts_dir / "daemon_stderr.log", "w", encoding="utf-8", errors="replace")
@@ -147,6 +158,12 @@ class RdpSession:
         self._proc = None
         self.status = "closed"
         self.evidence("session_close", {})
+
+    @property
+    def dead(self) -> bool:
+        """True once the daemon is gone or the session ended. A RemoteApp
+        session goes dead when its app exits — that is its normal end."""
+        return self._closed.is_set() or self.status in ("closed", "dead")
 
     def __enter__(self):
         self.start()

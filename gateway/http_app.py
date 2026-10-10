@@ -105,6 +105,24 @@ def create_app(pool: SessionPool) -> FastAPI:
         p = await _body(req)
         return _run(name, lambda: _box(name).file_pull(str(p.get("guest_path", "")), p.get("local_path")))
 
+    @app.post("/vm/{name}/app/start")
+    async def app_start(name: str, req: Request) -> dict:
+        """Swap the target's session over to a RemoteApp (RAIL) session that
+        launches `app`; it ends when the app exits. Body: {"app": "...",
+        "args"?, "workdir"?}."""
+        p = await _body(req)
+        app = str(p.get("app", "")).strip()
+        if not app:
+            return {"ok": False, "code": "E_ARGS", "detail": "app is required"}
+        try:
+            return pool.start_app(name, app, p.get("args"), p.get("workdir"))
+        except GatewayError as e:
+            return {"ok": False, "code": e.code, "detail": e.detail}
+        except KeyError as e:
+            return {"ok": False, "code": "E_ARGS", "detail": str(e)}
+        except RuntimeError as e:
+            return {"ok": False, "code": "E_CONFIG", "detail": str(e)}
+
     @app.get("/vm/{name}/state")
     def state(name: str) -> dict:
         return _run(name, lambda: _box(name).state())

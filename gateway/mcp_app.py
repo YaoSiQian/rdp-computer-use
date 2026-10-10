@@ -29,6 +29,31 @@ def create_mcp(pool: SessionPool, profile: str) -> FastMCP:
 
 
     @mcp.tool()
+    async def start_app(app: str, args: str | None = None) -> str:
+        """Start a task-scoped RemoteApp session that launches `app` (RAIL:
+        only the app's window is on the screen, no desktop).
+
+        Lifecycle rules:
+        - This disconnects the current desktop session on the target; there is
+          one session per target, so expect any desktop state to be gone.
+        - The session ends when the app exits — that is the normal lifecycle,
+          not a failure. After it ends, the next tool call gets a fresh
+          desktop session automatically.
+        - Use start_app when the whole task lives inside one application
+          (smaller observation, deterministic start/exit boundaries). Use the
+          default desktop session when the task spans several apps, the shell,
+          or unknown launch points.
+        - The guest must allow the program as a RemoteApp (allow-list or the
+          fAllowUnlistedRemotePrograms policy), otherwise E_APP_START is
+          returned and the previous session mode is restored on next call.
+        """
+        try:
+            return _json(pool.start_app(profile, app, args))
+        except GatewayError as e:
+            return _json({"ok": False, "code": e.code, "detail": e.detail})
+
+
+    @mcp.tool()
     async def screenshot(wait_stable_ms: int = 1500, tol_px: int = 64) -> list:
         """Take a screenshot of the remote desktop.
 
@@ -132,7 +157,9 @@ def create_mcp(pool: SessionPool, profile: str) -> FastMCP:
 
     @mcp.tool()
     async def state() -> str:
-        """Session state: uptime, input counters, last death signature."""
+        """Session state: uptime, input counters, last death signature.
+        RemoteApp sessions (see start_app) also report session_mode,
+        rail_exec and app_window."""
         try:
             return _json(_box().state())
         except GatewayError as e:
