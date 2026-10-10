@@ -510,7 +510,58 @@ impl Daemon {
                 self.mark_input();
                 Ok(self.input_response())
             }
-            "scroll" => Err(serr("E_UNSUPPORTED", "scroll awaits the wheel-encoding probe; use keyboard alternatives")),
+            "scroll" => {
+                let delta = p
+                    .get("delta")
+                    .and_then(|v| v.as_i64())
+                    .ok_or_else(|| serr("E_RANGE", "scroll needs an integer 'delta' (wheel rotation units)"))?;
+                if delta == 0 || delta.unsigned_abs() > 1200 {
+                    return Err(serr("E_RANGE", "delta must be nonzero, |delta| <= 1200 rotation units"));
+                }
+                self.golden_shot()?;
+                let mut events = Vec::new();
+                // The server positions the pointer from the coordinates each
+                // mouse PDU carries, so every wheel chunk must repeat the
+                // landing point — (0,0) would yank it to the title bar.
+                let coords = match (p.get("x").and_then(|v| v.as_i64()), p.get("y").and_then(|v| v.as_i64())) {
+                    (Some(x), Some(y)) => {
+                        let (x, y) = (
+                            u16::try_from(x).map_err(|_| serr("E_RANGE", "x out of range"))?,
+                            u16::try_from(y).map_err(|_| serr("E_RANGE", "y out of range"))?,
+                        );
+                        Some((x, y))
+                    }
+                    _ => None,
+                };
+                let (at_x, at_y) = coords.unwrap_or((0, 0));
+                if coords.is_some() {
+                    events.push(FastPathInputEvent::MouseEvent(MousePdu {
+                        flags: PointerFlags::MOVE,
+                        number_of_wheel_rotation_units: 0,
+                        x_position: at_x,
+                        y_position: at_y,
+                    }));
+                }
+                // Each wheel PDU carries only a 9-bit two's-complement rotation
+                // count, so a larger delta is chunked into 120-unit notches.
+                // The bare VERTICAL_WHEEL bit is what reference clients put on
+                // the wire; ORing the middle-button flag makes some servers
+                // classify the PDU as a middle-button event and drop it.
+                let mut remaining = delta;
+                while remaining != 0 {
+                    let units = remaining.clamp(-120, 120);
+                    remaining -= units;
+                    events.push(FastPathInputEvent::MouseEvent(MousePdu {
+                        flags: PointerFlags::VERTICAL_WHEEL,
+                        number_of_wheel_rotation_units: units as i16,
+                        x_position: at_x,
+                        y_position: at_y,
+                    }));
+                }
+                self.send_events(events, 60)?;
+                self.mark_input();
+                Ok(self.input_response())
+            }
             "wait" => {
                 let ms = pget(p, "ms").unwrap_or(1000).min(60_000);
                 let Conn { framed, stage, image, activation, .. } = self.conn.as_mut().unwrap();
