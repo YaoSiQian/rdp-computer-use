@@ -641,6 +641,32 @@ pub(crate) fn connect(
     Err(last_error.expect("at least one attempt").context("all connection attempts failed"))
 }
 
+/// Connection-ladder classification (design §7.2) for a failed `connect()`:
+/// the error chain is only structured on this side of the wire, so the daemon
+/// attaches the ladder code to its dead event and the gateway surfaces it
+/// verbatim instead of pattern-matching error strings.
+pub(crate) fn classify_connect_error(err: &anyhow::Error) -> &'static str {
+    for cause in err.chain() {
+        if let Some(connector) = cause.downcast_ref::<connector::ConnectorError>() {
+            return match connector.kind() {
+                connector::ConnectorErrorKind::Credssp(_)
+                | connector::ConnectorErrorKind::AccessDenied
+                | connector::ConnectorErrorKind::Negotiation(_) => "E_AUTH",
+                // Anything later in the sequence (MCS join, license exchange,
+                // capability sets, activation — including a server refusing
+                // RemoteApp at the negotiation stage) is a capability-level
+                // refusal.
+                _ => "E_CAPABILITY",
+            };
+        }
+        let text = cause.to_string();
+        if text.contains("TCP connect") || text.contains("lookup addr") {
+            return "E_CONN_TARGET";
+        }
+    }
+    "E_CONN"
+}
+
 fn connect_once(
     config: connector::Config,
     server_name: &str,
@@ -2443,6 +2469,33 @@ mod config_tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Ladder codes (§7.2) attach structurally: transport-context errors land
+    /// on E_CONN_TARGET, connector-sequence negotiation/auth errors on E_AUTH,
+    /// later-sequence refusals on E_CAPABILITY.
+    #[test]
+    fn connect_ladder_classification() {
+        use ironrdp::connector::{ConnectorError, ConnectorErrorKind, NegotiationFailure};
+        use ironrdp_pdu::nego::FailureCode;
+
+        let tcp: anyhow::Error = anyhow::Error::from(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused"))
+            .context("TCP connect")
+            .context("all connection attempts failed");
+        assert_eq!(super::classify_connect_error(&tcp), "E_CONN_TARGET");
+
+        let auth: anyhow::Error = ConnectorError::new(
+            "negotiation",
+            ConnectorErrorKind::Negotiation(NegotiationFailure::from(FailureCode::HYBRID_REQUIRED_BY_SERVER)),
+        )
+        .into();
+        assert_eq!(super::classify_connect_error(&auth), "E_AUTH");
+
+        let cap: anyhow::Error = ConnectorError::new("activation", ConnectorErrorKind::General).into();
+        assert_eq!(super::classify_connect_error(&cap), "E_CAPABILITY");
+
+        let misc: anyhow::Error = anyhow::anyhow!("something else");
+        assert_eq!(super::classify_connect_error(&misc), "E_CONN");
+    }
 
     /// With no session-mode env set, the connector config must stay a plain
     /// desktop session: no INFO_RAIL, no alternate shell, no RAIL capability.

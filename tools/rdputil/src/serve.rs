@@ -47,9 +47,9 @@ use ironrdp_pdu::WriteBuf;
 use ironrdp_rail::pdu::{SystemCommand, SystemCommandPdu};
 
 use crate::{
-    clip_tick, connect, frame_hash, golden_text_formats, pump_until, rail_exec_verdict, rail_kickoff, rail_reset,
-    remote_app_label, send_input_event, send_t120_announce, session_mode, AnyFramed, ClipState, CommonArgs,
-    RdpdrCap, RdpdrGate, RAIL_EXEC_OK, RAIL_WINDOW, RDPDR_DRIVE_NAME,
+    classify_connect_error, clip_tick, connect, frame_hash, golden_text_formats, pump_until, rail_exec_verdict,
+    rail_kickoff, rail_reset, remote_app_label, send_input_event, send_t120_announce, session_mode, AnyFramed,
+    ClipState, CommonArgs, RdpdrCap, RdpdrGate, RAIL_EXEC_OK, RAIL_WINDOW, RDPDR_DRIVE_NAME,
 };
 use crate::rail::{RailClient, RailInputEvent};
 
@@ -57,8 +57,8 @@ const PUMP_SLICE_MS: u64 = 250;
 const STABLE_RUN_SLICES: u32 = 3;
 
 /// Error surfaced to the JSON layer. Codes follow the design's error model;
-/// the connection-ladder family codes (E_CONN_TARGET etc.) are attached by
-/// the gateway, which sees the connect phase from outside.
+/// connect-phase failures additionally carry the §7.2 ladder code
+/// (E_CONN_TARGET/E_AUTH/E_CAPABILITY) in the dead event detail.
 pub(crate) struct SrvErr {
     code: &'static str,
     detail: String,
@@ -245,6 +245,7 @@ struct Daemon {
     last_shot: Option<Value>,
     reconnects: u32,
     last_sig: Option<String>,
+    last_connect_code: Option<&'static str>,
     boot: Instant,
 }
 
@@ -286,6 +287,7 @@ pub(crate) fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         last_shot: None,
         reconnects: 0,
         last_sig: None,
+        last_connect_code: None,
         boot: Instant::now(),
         args,
         common,
@@ -878,6 +880,7 @@ impl Daemon {
             "last_shot": self.last_shot,
             "reconnects": self.reconnects,
             "last_sig": self.last_sig,
+            "verify": {"last_connect_code": self.last_connect_code},
             "golden_rule": self.args.golden_rule,
             "rdpdr": self.rdpdr_gate.as_ref().map_or_else(|| "off".to_owned(), |g| g.cap().as_label()),
             "session_mode": session_mode(),
@@ -1042,16 +1045,23 @@ impl Daemon {
                 });
                 self.status = "active";
                 self.connected_at = Some(Instant::now());
+                self.last_connect_code = None;
                 self.inputs_since_shot = 0;
                 self.last_shot = None;
                 self.emit(json!({"ev": "session", "state": "connected", "desktop": {"w": w, "h": h}}));
             }
             Err(e) => {
                 self.last_sig = Some("connect_failed".to_owned());
+                self.last_connect_code = Some(classify_connect_error(&e));
                 self.status = "dead";
-                self.emit(
-                    json!({"ev": "session", "state": "dead", "detail": {"sig": "connect_failed", "error": format!("{e:#}")}}),
-                );
+                self.emit(json!({
+                    "ev": "session", "state": "dead",
+                    "detail": {
+                        "sig": "connect_failed",
+                        "code": self.last_connect_code,
+                        "error": format!("{e:#}"),
+                    }
+                }));
             }
         }
     }
