@@ -261,7 +261,7 @@ fn main() -> anyhow::Result<()> {
     // Value-aware: probing scripts export RDPUTIL_LEGACY_INPUT=0 to mean "off";
     // a presence check (is_some) would flip legacy mode on and feed nt5 mouse
     // values to modern servers, killing the session.
-    ironrdp_pdu::input::set_legacy_nt5_input(matches!(
+    ironrdp_pdu::input::set_legacy_input(matches!(
         std::env::var("RDPUTIL_LEGACY_INPUT").as_deref(),
         Ok("1") | Ok("true") | Ok("on")
     ));
@@ -1113,7 +1113,7 @@ pub(crate) fn slow_input_event(event: &FastPathInputEvent) -> anyhow::Result<Inp
             // Down is all bits clear on both. The earlier field conclusion
             // "0x8000 never landed, 0x0001 does" was a misread: a RIGHT-flag
             // down lands as a visible press, masking the missing release.
-            let release_bit: u16 = if ironrdp_pdu::input::legacy_nt5_input() {
+            let release_bit: u16 = if ironrdp_pdu::input::legacy_input() {
                 0x8000
             } else {
                 0x0001
@@ -1435,7 +1435,7 @@ pub(crate) fn clip_tick(framed: &mut AnyFramed, active_stage: &mut ActiveStage, 
     use std::sync::atomic::Ordering;
     // Probe mode 4: stay silent on init so `cb` can send a bare Format Data
     // Request — tests whether the server responds to ANY client PDU.
-    if std::env::var("RDPUTIL_CLIP_MODE").as_deref() == Ok("4") {
+    if std::env::var("IRONRDP_CLIP_MODE").as_deref() == Ok("4") {
         clip.advertised.store(true, Ordering::Relaxed);
         return;
     }
@@ -1745,7 +1745,7 @@ fn drive_loop(
                         let Some(clip) = clip else {
                             anyhow::bail!("cliprdr disabled (restart with RDPUTIL_CLIPRDR=1)");
                         };
-                        let force = std::env::var("RDPUTIL_CLIP_MODE").as_deref() == Ok("4");
+                        let force = std::env::var("IRONRDP_CLIP_MODE").as_deref() == Ok("4");
                         let start = Instant::now();
                         while !*clip.ready.lock().unwrap() {
                             if force {

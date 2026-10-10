@@ -709,7 +709,7 @@ impl Daemon {
         // ask us to render it before answering — visible as a Format Data
         // Request on stderr — then return the data. A FAIL response means the
         // advertisement was never registered.
-        if formats.is_empty() && std::env::var("RDPUTIL_CLIP_MODE").as_deref() != Ok("5") {
+        if formats.is_empty() && std::env::var("IRONRDP_CLIP_MODE").as_deref() != Ok("5") {
             return Err(serr("E_CLIP", format!("guest offers no CF_UNICODETEXT (formats={formats:?})")));
         }
         *clip.response.lock().unwrap() = None;
