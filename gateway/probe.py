@@ -1,8 +1,8 @@
 """Target probe: synthesize a `detected_profile` for an unfamiliar target.
 
-Implements the design's detection pipeline (§2.8 as revised by §2.8.1):
-everything is judged from host + account + password — no per-name knowledge.
-Steps, each failure carrying its §7.2 ladder code:
+The detection pipeline: everything is judged from host + account +
+password — no per-name knowledge. Steps, each failure carrying its
+connection-ladder code:
 
 1. TCP dial (E_CONN_TARGET on failure);
 2. daemon-mode connect, default security first, then an escalation retry

@@ -641,7 +641,7 @@ pub(crate) fn connect(
     Err(last_error.expect("at least one attempt").context("all connection attempts failed"))
 }
 
-/// Connection-ladder classification (design §7.2) for a failed `connect()`:
+/// Connection-ladder classification for a failed `connect()`:
 /// the error chain is only structured on this side of the wire, so the daemon
 /// attaches the ladder code to its dead event and the gateway surfaces it
 /// verbatim instead of pattern-matching error strings.
@@ -2470,7 +2470,7 @@ mod config_tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    /// Ladder codes (§7.2) attach structurally: transport-context errors land
+    /// Ladder codes attach structurally: transport-context errors land
     /// on E_CONN_TARGET, connector-sequence negotiation/auth errors on E_AUTH,
     /// later-sequence refusals on E_CAPABILITY.
     #[test]

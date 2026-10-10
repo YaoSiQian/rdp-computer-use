@@ -2,7 +2,7 @@
 
 Some servers (e.g. GNOME Remote Desktop on Wayland) never push a second
 frame on an established connection, so a long-lived daemon has nothing to
-observe after connect. The workaround (design doc §2.7) is the one-shot
+observe after connect. The workaround is the one-shot
 engine: every operation is its own short-lived `rdputil` process —
 
     screenshot = connect -> first frame -> save -> disconnect

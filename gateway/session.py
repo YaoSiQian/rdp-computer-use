@@ -89,7 +89,7 @@ class RdpSession:
         self.desktop: dict | None = None
         self.status = "starting"
         self.last_sig: str | None = None
-        # §7.2 ladder code from the daemon's dead event (E_CONN_TARGET /
+        # Connection-ladder code from the daemon's dead event (E_CONN_TARGET /
         # E_AUTH / E_CAPABILITY); None while the connect phase never failed.
         self.connect_code: str | None = None
 

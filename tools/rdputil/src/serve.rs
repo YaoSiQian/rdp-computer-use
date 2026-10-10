@@ -56,9 +56,9 @@ use crate::rail::{RailClient, RailInputEvent};
 const PUMP_SLICE_MS: u64 = 250;
 const STABLE_RUN_SLICES: u32 = 3;
 
-/// Error surfaced to the JSON layer. Codes follow the design's error model;
-/// connect-phase failures additionally carry the §7.2 ladder code
-/// (E_CONN_TARGET/E_AUTH/E_CAPABILITY) in the dead event detail.
+/// Error surfaced to the JSON layer. Connect-phase failures additionally
+/// carry the connection-ladder code (E_CONN_TARGET/E_AUTH/E_CAPABILITY) in
+/// the dead event detail.
 pub(crate) struct SrvErr {
     code: &'static str,
     detail: String,

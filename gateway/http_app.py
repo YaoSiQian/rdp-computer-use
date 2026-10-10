@@ -125,7 +125,7 @@ def create_app(pool: SessionPool) -> FastAPI:
 
     @app.post("/vm/{name}/probe")
     def probe(name: str) -> dict:
-        """Run the §2.8 detection pipeline; rewrites detected_profile."""
+        """Run the detection pipeline; rewrites detected_profile."""
         try:
             return pool.probe(name)
         except GatewayError as e:

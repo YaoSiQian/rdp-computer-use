@@ -212,7 +212,7 @@ class SessionPool:
         return "oneshot" if detected.get("engine_hint") == "oneshot" else "daemon"
 
     def probe(self, name: str) -> dict:
-        """Run the §2.8 detection pipeline against a target and merge the
+        """Run the detection pipeline against a target and merge the
         result into its profile entry as `detected_profile` (file rewritten).
         Ladder outcomes are reported, not raised; only configuration problems
         (unknown name, missing password env) raise."""

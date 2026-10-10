@@ -55,7 +55,7 @@ def create_mcp(pool: SessionPool, profile: str) -> FastMCP:
 
     @mcp.tool()
     async def probe() -> str:
-        """Re-run target detection (design §2.8): connection ladder, frame
+        """Re-run target detection: connection ladder, frame
         mode, RemoteApp capability. Merges the result into the target's
         detected_profile, which gates engine choice and start_app.
 

@@ -17,7 +17,7 @@ from .session import GatewayError, RdpSession
 
 
 class ToolBox:
-    """Binds a session to the v1 tool surface (design doc §工具面)."""
+    """Binds a session to the tool surface."""
 
     def __init__(self, session: RdpSession):
         self.session = session
