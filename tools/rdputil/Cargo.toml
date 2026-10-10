@@ -14,6 +14,7 @@ ironrdp-graphics = { path = "../../experiments/IronRDP-src/crates/ironrdp-graphi
 ironrdp-rdpdr = { path = "../../experiments/IronRDP-src/crates/ironrdp-rdpdr" }
 ironrdp-rdpdr-native = { path = "../../experiments/IronRDP-src/crates/ironrdp-rdpdr-native" }
 ironrdp-rdpsnd = { path = "../../experiments/IronRDP-src/crates/ironrdp-rdpsnd" }
+ironrdp-rail = { path = "../../experiments/IronRDP-src/crates/ironrdp-rail" }
 pico-args = "0.5"
 serde_json = "1"
 base64 = "0.22"

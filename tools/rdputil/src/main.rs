@@ -20,12 +20,14 @@
 #![allow(unused_crate_dependencies)] // false positives because there is both a library and a binary
 #![allow(clippy::print_stdout)]
 
+mod rail;
 mod serve;
 
 use core::time::Duration;
 use std::io::{BufRead, Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -48,6 +50,7 @@ use ironrdp::pdu::input::mouse::{MousePdu, PointerFlags};
 use ironrdp::pdu::rdp::capability_sets::MajorPlatformType;
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{ActiveStage, ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason};
+use ironrdp_rail::pdu::{ActivatePdu, ExecutePdu, ExecuteResult, GetApplicationIdRequestPdu};
 use ironrdp_rdpdr::pdu::efs::{
     AnyIoCtlCode, DecodedDeviceControlRequest, DeviceControlRequest, DeviceIoRequest, NtStatus, PrinterIoRequest,
     ServerDeviceAnnounceResponse, ServerDriveIoRequest,
@@ -55,6 +58,38 @@ use ironrdp_rdpdr::pdu::efs::{
 use ironrdp_rdpdr::pdu::esc::{ScardCall, ScardIoCtlCode};
 use ironrdp_rdpdr::{RdpdrBackend, RdpdrBackendFactory, RdpdrDrive};
 use ironrdp_rdpdr_native as rdpdr_native;
+
+use rail::{RailClient, RailControlEvent, RailEvent, RailInputEvent};
+
+/// Verdict of the RAIL EXEC order in the current session, shared with the
+/// serve daemon's loss triage: after a successful launch, the server tearing
+/// the connection down when the app's last window closes is the expected
+/// RemoteApp episode boundary, not a fault.
+pub(crate) static RAIL_EXEC_OK: AtomicBool = AtomicBool::new(false);
+pub(crate) static RAIL_EXEC_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// Grace deadline for releasing the queued RAIL EXEC after the server
+/// handshake. Session-scoped state rather than a pump_until local: the serve
+/// daemon pumps in short slices and the window routinely outlives the slice
+/// that received the handshake, so a per-call local would drop it unissued.
+static RAIL_RELEASE: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Window id of the launched RemoteApp awaiting its Activate report. The first
+/// top-level window the server describes after a successful launch is the app
+/// itself; reporting it activated stands in for the focus click an interactive
+/// client sends, without which the session's window-manager shortcuts (Alt+F4)
+/// have no target and the app can never be torn down by the user side.
+static RAIL_ACTIVATE: Mutex<Option<u32>> = Mutex::new(None);
+
+/// Server-side window id of the launched RemoteApp, once known. The app_close
+/// op targets it. 0 means no app window has been identified this session.
+pub(crate) static RAIL_WINDOW: AtomicU32 = AtomicU32::new(0);
+
+/// Post-launch window ids awaiting identity confirmation via GET_APPLICATIONID.
+static RAIL_PROBE: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Window ids whose identity was already requested this session.
+static RAIL_PROBED: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
 /// Display name of the redirected drive as the guest sees it:
 /// \\tsclient\<RDPDR_DRIVE_NAME>.
@@ -622,6 +657,16 @@ fn connect_once(
     if rdpdr.is_some() {
         config.enable_audio_playback = true;
     }
+    // Snapshot before the config moves into the connector: the RAIL processor
+    // seeds its work-area system parameters with the same client identity the
+    // Info PDU carries.
+    let rail_client = remote_app_requested().then(|| {
+        RailClient::new(
+            config.client_build,
+            config.desktop_size.width,
+            config.desktop_size.height,
+        )
+    });
     let server_addr = lookup_addr(server_name, port).context("lookup addr")?;
 
     info!(%server_addr, "Looked up server address");
@@ -723,6 +768,15 @@ fn connect_once(
             ironrdp::dvc::DrdynvcClient::new()
                 .with_dynamic_channel(ironrdp::displaycontrol::client::DisplayControlClient::new(|_| Ok(Vec::new()))),
         );
+    }
+
+    // RemoteApp (RAIL, RDPUTIL_REMOTE_APP): the connector advertises INFO_RAIL
+    // and negotiates the RAIL capability; the launch itself travels as an EXEC
+    // order on the "rail" static channel once the server handshake completes
+    // (rail_kickoff). MS-RDPERP requires the launch data here, not in the
+    // Client Info PDU.
+    if let Some(rail_client) = rail_client {
+        connector = connector.with_static_channel(rail_client);
     }
 
     let should_upgrade = ironrdp_blocking::connect_begin(&mut framed, &mut connector).context("begin connection")?;
@@ -857,6 +911,10 @@ fn active_stage(
         security: connection_result.security,
     }
     .build();
+
+    // RemoteApp: queue the launch right away; the RAIL processor releases it
+    // after the server handshake (rail_service). No-op in desktop mode.
+    rail_kickoff(&mut active_stage, &mut framed)?;
 
     // Ask the server to repaint the whole desktop. Reconnecting to a static
     // session (e.g. XP) resends no deltas on its own, which leaves the
@@ -1127,6 +1185,13 @@ fn run_drive(common: &CommonArgs, image: &mut DecodedImage) -> anyhow::Result<()
             security: connection_result.security,
         }
         .build();
+
+        // RemoteApp launches once — on the first connection of the drive
+        // episode. A reconnect lands back in a plain desktop session; the
+        // app is gone by then.
+        if round == 1 {
+            rail_kickoff(&mut stage, &mut framed)?;
+        }
 
         // A reconnected framebuffers stays all-black until the server is asked
         // to repaint (XP field truth), and the input-ready T.120 announce must
@@ -1771,6 +1836,12 @@ pub(crate) fn pump_until(
             return Ok(false);
         }
 
+        // RAIL housekeeping runs before the read, not after: on a quiet wire
+        // the read below times out every iteration, and a release scheduled
+        // at the loop bottom would only ever run when other traffic happened
+        // to arrive — the queued launch would wait forever.
+        rail_service(framed, active_stage)?;
+
         let (action, payload) = match framed.read_pdu() {
             Ok((action, payload)) => (action, payload),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
@@ -1816,6 +1887,15 @@ pub(crate) fn pump_until(
                             Ok(()) => info!("GOODBYE sent"),
                             Err(e) => warn!(error = %format!("{e:#}"), "GOODBYE failed"),
                         }
+                        // RemoteApp lifecycle: after a successful EXEC the
+                        // server tears the session down when the app's last
+                        // window closes. That shutdown is the expected episode
+                        // boundary — end the pump on it instead of riding
+                        // through to the socket error.
+                        if RAIL_EXEC_OK.load(Ordering::Relaxed) {
+                            eprintln!("APP_SESSION_ENDED");
+                            return Ok(true);
+                        }
                     }
                     warn!(?reason, "Server requested terminate; ignoring and continuing");
                     continue 'pump;
@@ -1857,6 +1937,190 @@ pub(crate) fn pump_until(
         // guest file operations never stall between pump iterations.
         poll_rdpdr(framed, active_stage)?;
     }
+}
+
+/// Reads an env knob, trimming and treating blank as unset.
+fn non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().map(|v| v.trim().to_owned()).filter(|v| !v.is_empty())
+}
+
+/// RemoteApp requested via RDPUTIL_REMOTE_APP (RAIL session mode).
+pub(crate) fn remote_app_requested() -> bool {
+    non_empty_env("RDPUTIL_REMOTE_APP").is_some()
+}
+
+/// Session mode reported to the gateway's state op.
+pub(crate) fn session_mode() -> &'static str {
+    if remote_app_requested() {
+        "remoteapp"
+    } else if non_empty_env("RDPUTIL_ALT_SHELL").is_some() {
+        "altshell"
+    } else {
+        "desktop"
+    }
+}
+
+/// Program name of the requested app-scoped session, for state reporting.
+pub(crate) fn remote_app_label() -> String {
+    non_empty_env("RDPUTIL_REMOTE_APP")
+        .or_else(|| non_empty_env("RDPUTIL_ALT_SHELL"))
+        .unwrap_or_default()
+}
+
+/// Verdict of the current session's RAIL EXEC order, for state reporting.
+pub(crate) fn rail_exec_verdict() -> &'static str {
+    if RAIL_EXEC_OK.load(Ordering::Relaxed) {
+        "ok"
+    } else if RAIL_EXEC_FAILED.load(Ordering::Relaxed) {
+        "failed"
+    } else {
+        "none"
+    }
+}
+
+/// Clears the EXEC verdicts of the previous session: every fresh session
+/// starts with none, so an app exit can only ever refer to the current app.
+pub(crate) fn rail_reset() {
+    RAIL_EXEC_OK.store(false, Ordering::Relaxed);
+    RAIL_EXEC_FAILED.store(false, Ordering::Relaxed);
+    RAIL_WINDOW.store(0, Ordering::Relaxed);
+    *RAIL_RELEASE.lock().unwrap() = None;
+    *RAIL_ACTIVATE.lock().unwrap() = None;
+    RAIL_PROBE.lock().unwrap().clear();
+    RAIL_PROBED.lock().unwrap().clear();
+}
+
+/// Queues the RemoteApp EXEC order right after activation. The RAIL processor
+/// holds the order until the server handshake completes, then rail_service
+/// releases it. Call once per fresh session — a reconnect must not launch a
+/// second app instance.
+pub(crate) fn rail_kickoff(active_stage: &mut ActiveStage, framed: &mut AnyFramed) -> anyhow::Result<()> {
+    let Some(program) = non_empty_env("RDPUTIL_REMOTE_APP") else {
+        return Ok(());
+    };
+    rail_reset();
+    let pdu = ExecutePdu {
+        flags: 0,
+        executable: program,
+        working_directory: non_empty_env("RDPUTIL_REMOTE_APP_WORKDIR").unwrap_or_default(),
+        arguments: non_empty_env("RDPUTIL_REMOTE_APP_ARGS").unwrap_or_default(),
+    };
+    eprintln!("RAIL EXEC queued exe={}", pdu.executable);
+    let (name, messages) = {
+        let processor = active_stage
+            .get_svc_processor_mut::<RailClient>()
+            .context("RAIL channel missing: the server refused the RAIL capability")?;
+        let messages = processor
+            .queue_execute(pdu)
+            .map_err(|e| anyhow::anyhow!("queue RAIL EXEC: {e}"))?;
+        (processor.channel_name(), messages)
+    };
+    // While queued the launch emits no bytes; a non-empty batch means the
+    // channel was already established (not expected this early) — flush anyway.
+    let messages: Vec<SvcMessage> = messages.into();
+    if !messages.is_empty() {
+        let frame = active_stage
+            .process_svc_messages_by_name(&name, messages)
+            .context("encode RAIL EXEC")?;
+        framed.write_all(frame.as_slice()).context("write RAIL EXEC")?;
+    }
+    Ok(())
+}
+
+/// Per-iteration RAIL housekeeping inside the pump loop: drain processor
+/// events, record EXEC results, and release the queued launch a beat after
+/// the server handshake. The desktop client releases when its window is
+/// ready; headless there is no window, so a fixed grace stands in (the same
+/// 250 ms deadline upstream uses). No-op unless a RemoteApp session was
+/// requested.
+fn rail_service(framed: &mut AnyFramed, active_stage: &mut ActiveStage) -> anyhow::Result<()> {
+    let events = match active_stage.get_svc_processor_mut::<RailClient>() {
+        Some(processor) => processor.take_events(),
+        None => return Ok(()),
+    };
+    for event in events {
+        match event {
+            RailEvent::Handshake { queued_execute_count, .. } => {
+                eprintln!("RAIL handshake queued_executes={queued_execute_count}");
+                *RAIL_RELEASE.lock().unwrap() = Some(Instant::now() + Duration::from_millis(250));
+            }
+            RailEvent::ExecuteResult(result) => {
+                let ok = result.result == ExecuteResult::Ok;
+                eprintln!(
+                    "RAIL EXEC_RESULT result={:?} raw={} exe={}",
+                    result.result, result.raw_result, result.executable
+                );
+                if ok {
+                    RAIL_EXEC_OK.store(true, Ordering::Relaxed);
+                } else {
+                    RAIL_EXEC_FAILED.store(true, Ordering::Relaxed);
+                }
+            }
+            RailEvent::Control(RailControlEvent::MinMaxInfo(info)) => {
+                if RAIL_EXEC_OK.load(Ordering::Relaxed) && info.window_id != 0 {
+                    // Activate once per session: the server re-reports MinMaxInfo
+                    // periodically, and re-arming here would loop forever.
+                    let mut pending = RAIL_ACTIVATE.lock().unwrap();
+                    if pending.is_none() && RAIL_WINDOW.load(Ordering::Relaxed) == 0 {
+                        *pending = Some(info.window_id);
+                    }
+                    drop(pending);
+                    let mut probed = RAIL_PROBED.lock().unwrap();
+                    if !probed.contains(&info.window_id) {
+                        probed.push(info.window_id);
+                        RAIL_PROBE.lock().unwrap().push(info.window_id);
+                    }
+                }
+            }
+            RailEvent::ApplicationId { window_id, application_id, process_id, process_image_name } => {
+                eprintln!(
+                    "RAIL appid window={window_id} app={application_id} pid={:?} image={:?}",
+                    process_id, process_image_name
+                );
+            }
+            _ => {}
+        }
+    }
+    let (name, messages) = match active_stage.get_svc_processor_mut::<RailClient>() {
+        Some(processor) => {
+            let due = RAIL_RELEASE.lock().unwrap().is_some_and(|at| Instant::now() >= at);
+            let mut messages: Vec<SvcMessage> = if due {
+                *RAIL_RELEASE.lock().unwrap() = None;
+                processor
+                    .release_queued_after_handshake()
+                    .map_err(|e| anyhow::anyhow!("release queued RAIL: {e}"))?
+                    .into()
+            } else {
+                Vec::new()
+            };
+            if let Some(window_id) = RAIL_ACTIVATE.lock().unwrap().take() {
+                RAIL_WINDOW.store(window_id, Ordering::Relaxed);
+                eprintln!("RAIL activate window={window_id}");
+                let activate: Vec<SvcMessage> = processor
+                    .queue_input(RailInputEvent::Activate(ActivatePdu { window_id, enabled: true }))
+                    .map_err(|e| anyhow::anyhow!("queue RAIL activate: {e}"))?
+                    .into();
+                messages.extend(activate);
+            }
+            for probe_id in RAIL_PROBE.lock().unwrap().drain(..) {
+                let probe: Vec<SvcMessage> = processor
+                    .queue_input(RailInputEvent::GetApplicationId(GetApplicationIdRequestPdu { window_id: probe_id }))
+                    .map_err(|e| anyhow::anyhow!("queue RAIL appid probe: {e}"))?
+                    .into();
+                messages.extend(probe);
+            }
+            (processor.channel_name(), messages)
+        }
+        None => return Ok(()),
+    };
+    if !messages.is_empty() {
+        eprintln!("RAIL release sent messages={}", messages.len());
+        let frame = active_stage
+            .process_svc_messages_by_name(&name, messages)
+            .context("encode RAIL release")?;
+        framed.write_all(frame.as_slice()).context("write RAIL release")?;
+    }
+    Ok(())
 }
 
 /// Drains deferred rdpdr responses (backend worker threads answering file IO)
@@ -2074,6 +2338,24 @@ fn build_config(
     // a clientBuild of 2600. Legacy winlogon copies these fields into the
     // WINSTATIONCLIENT structure it consults when starting the user desktop.
     let legacy_client = std::env::var("RDPUTIL_LEGACY_CLIENT").as_deref() == Ok("1");
+    // Session mode knobs (desktop mode when both unset):
+    // RDPUTIL_REMOTE_APP=<program> (+ _ARGS, _WORKDIR): RemoteApp — the
+    // connector sets INFO_RAIL and the "rail" channel carries the launch as an
+    // EXEC order (rail_kickoff); the session ends when the app exits.
+    // RDPUTIL_ALT_SHELL=<program> (+ _WORKDIR): the program replaces the
+    // desktop shell via the Client Info PDU alternate-shell field — the
+    // pre-RAIL mechanism that also reaches RDP 5.x servers.
+    let remote_app = non_empty_env("RDPUTIL_REMOTE_APP").is_some();
+    // mstsc fills the Client Info PDU alternate-shell field with rdpinit.exe
+    // in RemoteApp mode, and legacy (pre-Win8) servers only enter the
+    // RemoteApp flow when the session shell is rdpinit.exe; a blank field
+    // makes their EXEC orders silently no-op. An explicit RDPUTIL_ALT_SHELL
+    // overrides it.
+    let alt_shell = non_empty_env("RDPUTIL_ALT_SHELL")
+        .or_else(|| remote_app.then(|| "rdpinit.exe".to_string()));
+    if remote_app && legacy_client {
+        eprintln!("WARN RDPUTIL_REMOTE_APP with RDPUTIL_LEGACY_CLIENT: the legacy Info PDU flag set predates RAIL");
+    }
     Ok(connector::Config {
         credentials: Credentials::UsernamePassword { username, password },
         domain,
@@ -2144,11 +2426,55 @@ fn build_config(
         hardware_id: None,
         license_cache: None,
         timezone_info: TimezoneInfo::default(),
-        alternate_shell: String::new(),
-        work_dir: String::new(),
-        remote_application_mode: false,
-        rail_support_level: ironrdp_pdu::rdp::capability_sets::RailSupportLevel::empty(),
+        alternate_shell: alt_shell.unwrap_or_default(),
+        work_dir: non_empty_env("RDPUTIL_ALT_WORKDIR").unwrap_or_default(),
+        remote_application_mode: remote_app,
+        rail_support_level: if remote_app {
+            ironrdp_pdu::rdp::capability_sets::RailSupportLevel::SUPPORTED
+        } else {
+            ironrdp_pdu::rdp::capability_sets::RailSupportLevel::empty()
+        },
     })
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::build_config;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// With no session-mode env set, the connector config must stay a plain
+    /// desktop session: no INFO_RAIL, no alternate shell, no RAIL capability.
+    #[test]
+    fn defaults_to_desktop_session() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("RDPUTIL_REMOTE_APP");
+        std::env::remove_var("RDPUTIL_ALT_SHELL");
+        let config = build_config("u".to_owned(), "p".to_owned(), None, false, 0).unwrap();
+        assert!(!config.remote_application_mode);
+        assert!(config.alternate_shell.is_empty());
+        assert!(config.work_dir.is_empty());
+        assert!(config.rail_support_level.is_empty());
+    }
+
+    /// RemoteApp mode follows the mstsc convention: the Client Info PDU shell
+    /// field carries rdpinit.exe unless the operator overrides it, so legacy
+    /// (pre-Win8) servers enter the RemoteApp flow instead of dropping EXEC.
+    #[test]
+    fn remote_app_defaults_shell_to_rdpinit() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("RDPUTIL_REMOTE_APP", "notepad.exe");
+        std::env::remove_var("RDPUTIL_ALT_SHELL");
+        let config = build_config("u".to_owned(), "p".to_owned(), None, false, 0).unwrap();
+        assert!(config.remote_application_mode);
+        assert_eq!(config.alternate_shell, "rdpinit.exe");
+        std::env::set_var("RDPUTIL_ALT_SHELL", "myshell.exe");
+        let config = build_config("u".to_owned(), "p".to_owned(), None, false, 0).unwrap();
+        assert_eq!(config.alternate_shell, "myshell.exe");
+        std::env::remove_var("RDPUTIL_REMOTE_APP");
+        std::env::remove_var("RDPUTIL_ALT_SHELL");
+    }
 }
 
 fn compression_type_from_level(level: u32) -> anyhow::Result<CompressionType> {

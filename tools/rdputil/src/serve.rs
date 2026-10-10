@@ -44,11 +44,14 @@ use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{ActiveStage, ActiveStageBuilder};
 use ironrdp::svc::SvcProcessor as _;
 use ironrdp_pdu::WriteBuf;
+use ironrdp_rail::pdu::{SystemCommand, SystemCommandPdu};
 
 use crate::{
-    clip_tick, connect, frame_hash, golden_text_formats, pump_until, send_input_event, send_t120_announce, AnyFramed,
-    ClipState, CommonArgs, RdpdrCap, RdpdrGate, RDPDR_DRIVE_NAME,
+    clip_tick, connect, frame_hash, golden_text_formats, pump_until, rail_exec_verdict, rail_kickoff, rail_reset,
+    remote_app_label, send_input_event, send_t120_announce, session_mode, AnyFramed, ClipState, CommonArgs,
+    RdpdrCap, RdpdrGate, RAIL_EXEC_OK, RAIL_WINDOW, RDPDR_DRIVE_NAME,
 };
+use crate::rail::{RailClient, RailInputEvent};
 
 const PUMP_SLICE_MS: u64 = 250;
 const STABLE_RUN_SLICES: u32 = 3;
@@ -520,6 +523,7 @@ impl Daemon {
             "resize" => self.op_resize(p),
             "refresh" => self.op_refresh(),
             "state" => self.op_state(),
+            "app_close" => self.op_app_close(),
             other => Err(serr("E_PROTO", format!("unknown op '{other}'"))),
         }
     }
@@ -830,10 +834,40 @@ impl Daemon {
         Ok(json!({}))
     }
 
+    /// Closes the launched RemoteApp the way the client-side title bar would:
+    /// a RAIL SYSCOMMAND order carrying SC_CLOSE, not a synthesized keystroke.
+    /// The server ends the session once the app's last window is gone, which
+    /// the daemon reports as the usual app_exit episode boundary.
+    fn op_app_close(&mut self) -> SrvResult {
+        let window_id = RAIL_WINDOW.load(std::sync::atomic::Ordering::Relaxed);
+        if window_id == 0 {
+            return Err(serr("E_APP", "no RemoteApp window is active"));
+        }
+        let Conn { framed, stage, .. } = self.conn.as_mut().unwrap();
+        let (name, messages) = {
+            let processor = stage
+                .get_svc_processor_mut::<RailClient>()
+                .ok_or_else(|| serr("E_APP", "RAIL channel missing"))?;
+            let messages = processor
+                .queue_input(RailInputEvent::SystemCommand(SystemCommandPdu {
+                    window_id,
+                    command: SystemCommand::Close,
+                }))
+                .map_err(|e| serr("E_PROTO", format!("queue RAIL syscommand: {e}")))?;
+            (processor.channel_name(), messages)
+        };
+        let frame = stage
+            .process_svc_messages_by_name(&name, messages.into())
+            .map_err(|e| serr("E_PROTO", format!("encode RAIL syscommand: {e:#}")))?;
+        framed.write_all(frame.as_slice()).map_err(|e| serr("E_PROTO", format!("write RAIL syscommand: {e}")))?;
+        Ok(json!({ "app_close": window_id }))
+    }
+
     fn op_state(&mut self) -> SrvResult {
         Ok(json!({
             "status": self.status,
             "label": self.args.label,
+            "app_window": RAIL_WINDOW.load(std::sync::atomic::Ordering::Relaxed),
             "uptime_ms": self.boot.elapsed().as_millis() as u64,
             "connected_ms": self.connected_at.map(|t| t.elapsed().as_millis() as u64),
             "desktop": self.conn.as_ref().map(|c| json!({"w": c.image.width(), "h": c.image.height()})),
@@ -846,6 +880,9 @@ impl Daemon {
             "last_sig": self.last_sig,
             "golden_rule": self.args.golden_rule,
             "rdpdr": self.rdpdr_gate.as_ref().map_or_else(|| "off".to_owned(), |g| g.cap().as_label()),
+            "session_mode": session_mode(),
+            "remote_app": remote_app_label(),
+            "rail_exec": rail_exec_verdict(),
         }))
     }
 
@@ -965,6 +1002,15 @@ impl Daemon {
                         eprintln!("SERVE t120 announce failed: {e:#}");
                     }
                 }
+                // RemoteApp: launch once per daemon episode, on the first
+                // session. A reconnect lands in a plain desktop session — the
+                // app that ended the previous one is gone by then.
+                rail_reset();
+                if self.reconnects == 0 {
+                    if let Err(e) = rail_kickoff(&mut stage, &mut framed) {
+                        eprintln!("SERVE rail kickoff failed: {e:#}");
+                    }
+                }
                 if repaint {
                     // A reconnected framebuffer stays all-black until the
                     // server is asked to repaint.
@@ -1035,13 +1081,22 @@ impl Daemon {
         if input_violation {
             sig = "input_violation";
         }
+        // A RemoteApp session ends by design when the launched app closes: the
+        // server says goodbye and drops the transport. That is the expected
+        // episode boundary — report it, park the daemon, and let the gateway
+        // decide what comes next (a reconnect would launch a fresh app
+        // instance).
+        let app_exit = RAIL_EXEC_OK.load(std::sync::atomic::Ordering::Relaxed);
+        if app_exit {
+            sig = "app_exit";
+        }
         self.last_sig = Some(sig.to_owned());
         self.conn = None;
         self.connected_at = None;
         self.emit(json!({"ev": "session", "state": "dead", "detail": {"sig": sig, "error": detail}}));
 
-        if input_violation || !self.args.reconnect || self.reconnects >= 20 {
-            self.status = "dead";
+        if input_violation || app_exit || !self.args.reconnect || self.reconnects >= 20 {
+            self.status = if app_exit { "closed" } else { "dead" };
             return;
         }
         self.status = "reconnecting";
@@ -1280,16 +1335,18 @@ fn parse_combo(combo: &str) -> anyhow::Result<Vec<(u8, bool, bool)>> {
             "space" => (0x39, false, false),
             "backspace" | "bs" => (0x0e, false, false),
             "capslock" => (0x3a, false, false),
-            "delete" | "del" => (0xd3, true, false),
-            "insert" | "ins" => (0xd2, true, false),
-            "home" => (0xc7, true, false),
-            "end" => (0xcf, true, false),
-            "pgup" | "pageup" => (0xc9, true, false),
-            "pgdn" | "pgdown" | "pagedown" => (0xd1, true, false),
-            "up" => (0xc8, true, false),
-            "down" => (0xd0, true, false),
-            "left" => (0xcb, true, false),
-            "right" => (0xcd, true, false),
+            // Extended keys: the wire carries the Set-1 make code; extended-ness
+            // is expressed by the KBDFLAGS_EXTENDED flag, never by the 0x80 bit.
+            "delete" | "del" => (0x53, true, false),
+            "insert" | "ins" => (0x52, true, false),
+            "home" => (0x47, true, false),
+            "end" => (0x4f, true, false),
+            "pgup" | "pageup" => (0x49, true, false),
+            "pgdn" | "pgdown" | "pagedown" => (0x51, true, false),
+            "up" => (0x48, true, false),
+            "down" => (0x50, true, false),
+            "left" => (0x4b, true, false),
+            "right" => (0x4d, true, false),
             _ => {
                 if let Some(rest) = lower.strip_prefix("0x") {
                     let sc = u8::from_str_radix(rest, 16).context("bad hex scancode")?;

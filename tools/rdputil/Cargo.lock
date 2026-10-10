@@ -1394,6 +1394,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironrdp-rail"
+version = "0.1.0"
+dependencies = [
+ "ironrdp-core",
+ "ironrdp-svc",
+]
+
+[[package]]
 name = "ironrdp-rdpdr"
 version = "0.7.0"
 dependencies = [
@@ -2258,6 +2266,7 @@ dependencies = [
  "ironrdp-blocking",
  "ironrdp-graphics",
  "ironrdp-pdu",
+ "ironrdp-rail",
  "ironrdp-rdpdr",
  "ironrdp-rdpdr-native",
  "ironrdp-rdpsnd",
