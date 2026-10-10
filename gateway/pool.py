@@ -21,6 +21,11 @@ gateway/oneshot.py). One-shot profiles may also set `desktop_size`
 ([w, h] — fixed virtual display dead-edge crop), `retry_attempts` and
 `retry_interval_s`.
 
+When `engine` is not hand-set, `detected_profile.engine_hint` (written by
+`probe()`) decides: first_frame_only targets run one-shot, everything else
+stays on the daemon. The probe's winning `connect_env` is replayed on
+daemon spawns. Hand-set fields always win over detection.
+
 `profiles.sample.json` in this directory shows the schema with placeholder
 values. A single RDP session per target is enforced: asking for the same name
 twice hands back the same live session.
@@ -41,23 +46,35 @@ from pathlib import Path
 
 from .api import ToolBox
 from .oneshot import OneShotSession
+from .probe import run_probe
 from .session import GatewayError, RdpSession
 
 PROFILE_FILE = Path(__file__).resolve().parent / "profiles.json"
 
 
+def _profiles_path() -> Path:
+    override = os.environ.get("GATEWAY_PROFILES")
+    return Path(override) if override else PROFILE_FILE
+
+
 def load_profiles() -> dict:
-    if not PROFILE_FILE.exists():
+    path = _profiles_path()
+    if not path.exists():
         raise RuntimeError(
-            f"profiles file missing: {PROFILE_FILE} — create it from the sample schema "
+            f"profiles file missing: {path} — create it from the sample schema "
             "(hosts and usernames are environment-specific and stay out of the repo)"
         )
-    raw = json.loads(PROFILE_FILE.read_text(encoding="utf-8"))
+    raw = json.loads(path.read_text(encoding="utf-8"))
     profiles = raw.get("profiles", raw)
     for name, prof in profiles.items():
         env_key = prof.get("password_env", f"GATEWAY_{name.upper()}_PASS")
         prof.setdefault("password_env", env_key)
     return profiles
+
+
+def save_profiles(profiles: dict) -> None:
+    path = _profiles_path()
+    path.write_text(json.dumps({"profiles": profiles}, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 class SessionPool:
@@ -111,6 +128,13 @@ class SessionPool:
             prof = self.profiles.get(name)
             if prof is None:
                 raise KeyError(f"unknown profile '{name}' (have: {', '.join(sorted(self.profiles))})")
+            detected = prof.get("detected_profile") or {}
+            if (detected.get("capabilities") or {}).get("remote_app") is False:
+                raise GatewayError(
+                    "E_UNSUPPORTED",
+                    "probe judged this target RemoteApp-incapable (detected_profile.capabilities.remote_app=false); "
+                    "use the desktop session",
+                )
             old = self._sessions.pop(name, None)
             self._boxes.pop(name, None)
             # The new connection kicks the old one server-side anyway;
@@ -153,6 +177,11 @@ class SessionPool:
         password = os.environ.get(prof["password_env"], "")
         if not password:
             raise RuntimeError(f"environment variable {prof['password_env']} not set")
+        detected = prof.get("detected_profile") or {}
+        # Replay exactly the env combination the probe's connect ladder found
+        # working (e.g. CredSSP with T120 announce suppressed), not just a
+        # label of it.
+        extra_env: dict[str, str] = dict(detected.get("connect_env") or {})
         common = {
             "name": name,
             "host": prof["host"],
@@ -162,7 +191,7 @@ class SessionPool:
             "run_dir": self.run_root / f"{prof.get('run_prefix', '')}{name}",
             "golden_rule": golden_rule,
         }
-        if prof.get("engine", "daemon") == "oneshot":
+        if self._engine(prof) == "oneshot":
             if remote_app:
                 raise GatewayError("E_UNSUPPORTED", "one-shot engine has no RemoteApp session mode")
             return OneShotSession(
@@ -171,7 +200,32 @@ class SessionPool:
                 retry_interval_s=float(prof.get("retry_interval_s", 15.0)),
                 **common,
             )
-        return RdpSession(rdpdr=bool(prof.get("rdpdr", False)), remote_app=remote_app, **common)
+        return RdpSession(rdpdr=bool(prof.get("rdpdr", False)), remote_app=remote_app, extra_env=extra_env, **common)
+
+    @staticmethod
+    def _engine(prof: dict) -> str:
+        """Hand-set engine wins (prior seeds keep precedence over detection)."""
+        engine = prof.get("engine")
+        if engine:
+            return engine
+        detected = prof.get("detected_profile") or {}
+        return "oneshot" if detected.get("engine_hint") == "oneshot" else "daemon"
+
+    def probe(self, name: str) -> dict:
+        """Run the §2.8 detection pipeline against a target and merge the
+        result into its profile entry as `detected_profile` (file rewritten).
+        Ladder outcomes are reported, not raised; only configuration problems
+        (unknown name, missing password env) raise."""
+        profiles = load_profiles()
+        prof = profiles.get(name)
+        if prof is None:
+            raise KeyError(f"unknown profile '{name}' (have: {', '.join(sorted(profiles))})")
+        try:
+            result = run_probe(name, prof, daemon_path=self.daemon_path, run_root=self.run_root)
+        finally:
+            save_profiles(profiles)
+            self.profiles = load_profiles()
+        return result
 
     def close(self, name: str | None = None) -> None:
         with self._lock:

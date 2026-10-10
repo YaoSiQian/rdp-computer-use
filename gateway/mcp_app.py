@@ -54,6 +54,23 @@ def create_mcp(pool: SessionPool, profile: str) -> FastMCP:
 
 
     @mcp.tool()
+    async def probe() -> str:
+        """Re-run target detection (design §2.8): connection ladder, frame
+        mode, RemoteApp capability. Merges the result into the target's
+        detected_profile, which gates engine choice and start_app.
+
+        Use after the target's configuration changed (policy edits, server
+        upgrades, role switches) or when start_app/behaviour disagrees with
+        what the profile claims."""
+        try:
+            return _json(pool.probe(profile))
+        except GatewayError as e:
+            return _json({"ok": False, "code": e.code, "detail": e.detail})
+        except (KeyError, RuntimeError) as e:
+            return _json({"ok": False, "code": "E_CONFIG", "detail": str(e)})
+
+
+    @mcp.tool()
     async def screenshot(wait_stable_ms: int = 1500, tol_px: int = 64) -> list:
         """Take a screenshot of the remote desktop.
 

@@ -123,6 +123,18 @@ def create_app(pool: SessionPool) -> FastAPI:
         except RuntimeError as e:
             return {"ok": False, "code": "E_CONFIG", "detail": str(e)}
 
+    @app.post("/vm/{name}/probe")
+    def probe(name: str) -> dict:
+        """Run the §2.8 detection pipeline; rewrites detected_profile."""
+        try:
+            return pool.probe(name)
+        except GatewayError as e:
+            return {"ok": False, "code": e.code, "detail": e.detail}
+        except KeyError as e:
+            return {"ok": False, "code": "E_ARGS", "detail": str(e)}
+        except RuntimeError as e:
+            return {"ok": False, "code": "E_CONFIG", "detail": str(e)}
+
     @app.get("/vm/{name}/state")
     def state(name: str) -> dict:
         return _run(name, lambda: _box(name).state())

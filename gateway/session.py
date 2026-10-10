@@ -64,6 +64,7 @@ class RdpSession:
         cliprdr: bool = True,
         rdpdr: bool = False,
         extra_args: list[str] | None = None,
+        extra_env: dict[str, str] | None = None,
         remote_app: dict | None = None,
     ):
         self.name = name
@@ -79,6 +80,7 @@ class RdpSession:
         self.cliprdr = cliprdr
         self.rdpdr = rdpdr
         self.extra_args = extra_args or []
+        self.extra_env = dict(extra_env or {})
         # RemoteApp (RAIL) launch request: {"app", "args"?, "workdir"?}. When
         # set, the daemon connects in RemoteApp mode and the session's lifetime
         # is the app's lifetime — the server closes it when the app exits.
@@ -87,6 +89,9 @@ class RdpSession:
         self.desktop: dict | None = None
         self.status = "starting"
         self.last_sig: str | None = None
+        # §7.2 ladder code from the daemon's dead event (E_CONN_TARGET /
+        # E_AUTH / E_CAPABILITY); None while the connect phase never failed.
+        self.connect_code: str | None = None
 
         self._proc: subprocess.Popen | None = None
         self._stdin_lock = threading.Lock()
@@ -117,7 +122,7 @@ class RdpSession:
             redirect_root = self.run_dir / "redirect"
             redirect_root.mkdir(exist_ok=True)
             argv += ["--rdpdr", str(redirect_root)]
-        env = {**os.environ, "RDPUTIL_PASS": self.password}
+        env = {**os.environ, "RDPUTIL_PASS": self.password, **self.extra_env}
         if self.cliprdr:
             env["RDPUTIL_CLIPRDR"] = "1"
         if self.remote_app:
@@ -217,6 +222,8 @@ class RdpSession:
                 self.desktop = msg["desktop"]
             if msg.get("detail") and isinstance(msg["detail"], dict):
                 self.last_sig = msg["detail"].get("sig")
+                if msg["detail"].get("code"):
+                    self.connect_code = msg["detail"]["code"]
         elif ev == "bye":
             self.status = "closed"
             self._closed.set()
@@ -230,7 +237,10 @@ class RdpSession:
             if self.status == "connected":
                 return
             time.sleep(0.2)
-        raise GatewayError("E_CONN", f"session not connected (status={self.status}, sig={self.last_sig})")
+        raise GatewayError(
+            self.connect_code or "E_CONN",
+            f"session not connected (status={self.status}, sig={self.last_sig})",
+        )
 
     def call(self, op: str, p: dict | None = None, timeout: float = DEFAULT_TIMEOUT_S) -> dict:
         """Send one op, wait for its response, return the `r` payload."""
