@@ -4,7 +4,8 @@
       "host": "HOST_OR_IP",
       "username": "USER",
       "password_env": "GATEWAY_W10_PASS",
-      "rdpdr": true
+      "rdpdr": true,
+      "display_control": true
     },
     "w7": {
       "host": "HOST_OR_IP",

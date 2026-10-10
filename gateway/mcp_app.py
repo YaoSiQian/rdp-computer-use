@@ -148,8 +148,9 @@ def create_mcp(pool: SessionPool, profile: str) -> FastMCP:
     @mcp.tool()
     async def resize(w: int, h: int) -> str:
         """Resize the remote desktop to w×h through the display-control
-        channel (inline reactivation). Targets with a fixed virtual display
-        refuse this (E_UNSUPPORTED)."""
+        channel (inline reactivation). Requires the target profile to opt
+        into the display-control channel; targets without it refuse this
+        (E_UNSUPPORTED)."""
         try:
             return _json(_box().resize(w, h))
         except GatewayError as e:

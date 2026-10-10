@@ -14,6 +14,11 @@ environment). Schema:
 and enables the file_push/file_pull tools; servers that reject the redirect
 surface that as an E_UNAVAILABLE error at call time.
 
+`display_control` (optional, default false) attaches the Display Control
+dynamic channel (RDPUTIL_DISP=1) so the resize tool can change the remote
+resolution; without it the daemon answers E_UNSUPPORTED because the channel
+can only be negotiated at connect time.
+
 `engine` (optional, default "daemon") picks the session engine: "daemon" is
 the long-lived `rdputil serve` process; "oneshot" runs one short connection
 per op for servers that only send a single frame per connection (see
@@ -182,6 +187,8 @@ class SessionPool:
         # working (e.g. CredSSP with T120 announce suppressed), not just a
         # label of it.
         extra_env: dict[str, str] = dict(detected.get("connect_env") or {})
+        if prof.get("display_control"):
+            extra_env["RDPUTIL_DISP"] = "1"
         common = {
             "name": name,
             "host": prof["host"],
@@ -220,6 +227,10 @@ class SessionPool:
         prof = profiles.get(name)
         if prof is None:
             raise KeyError(f"unknown profile '{name}' (have: {', '.join(sorted(profiles))})")
+        # The probe takes over the interactive session; the pooled connection
+        # would race every probe stage's arbitration (the RAIL handshake is
+        # the sensitive one). toolbox() rebuilds it on the next call.
+        self.close(name)
         try:
             result = run_probe(name, prof, daemon_path=self.daemon_path, run_root=self.run_root)
         finally:

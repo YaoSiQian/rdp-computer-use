@@ -40,6 +40,7 @@ from .session import GatewayError, RdpSession
 
 CONNECT_TIMEOUT_S = 90.0
 RAIL_VERDICT_TIMEOUT_S = 30.0
+RAIL_RETRY_SETTLE_S = 5.0
 
 # RemoteApp probe payload: present everywhere, exits by itself, needs no
 # allowlist beyond unlisted-program permission.
@@ -174,11 +175,22 @@ class TargetProbe:
                 pass
         # The RemoteApp probe owns a fresh connection, so it runs even when
         # the main one died mid-probe — a one-shot kick does not predict the
-        # next connection's fate.
-        try:
-            profile["capabilities"]["remote_app"] = self._rail_probe(report)
-        except GatewayError as e:
-            report["ladder"].append({"level": "rail", "code": e.code})
+        # next connection's fate. A connect refusal is a capability verdict,
+        # but a silent no-verdict timeout races the arbitration of the
+        # just-closed desktop session and gets one clean retry.
+        for rail_attempt in (1, 2):
+            try:
+                verdict = self._rail_probe(report)
+            except GatewayError as e:
+                report["ladder"].append({"level": "rail", "code": e.code})
+                verdict = None
+            if verdict is not None:
+                profile["capabilities"]["remote_app"] = verdict
+                break
+            if rail_attempt == 1:
+                time.sleep(RAIL_RETRY_SETTLE_S)
+        else:
+            profile["capabilities"]["remote_app"] = False
         return profile, None
 
     def _connect_ladder(self, report: dict) -> tuple[dict | None, RdpSession | None]:
@@ -308,7 +320,7 @@ class TargetProbe:
             if verdict in ("ok", "failed"):
                 return True
             report["ladder"].append({"level": "rail", "code": "E_VERDICT_TIMEOUT", "verdict": verdict})
-            return False
+            return None
         finally:
             try:
                 session.close()
