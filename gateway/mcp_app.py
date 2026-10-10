@@ -135,6 +135,28 @@ def create_mcp(pool: SessionPool, profile: str) -> FastMCP:
 
 
     @mcp.tool()
+    async def scroll(delta: int, x: int | None = None, y: int | None = None) -> str:
+        """Turn the mouse wheel: negative `delta` scrolls down, positive up
+        (rotation units, 120 per physical notch, |delta| <= 1200). Pass x/y
+        to move the pointer there first so the wheel lands on that window."""
+        try:
+            return _json(_box().scroll(delta, x, y))
+        except GatewayError as e:
+            return _json({"ok": False, "code": e.code, "detail": e.detail})
+
+
+    @mcp.tool()
+    async def resize(w: int, h: int) -> str:
+        """Resize the remote desktop to w×h through the display-control
+        channel (inline reactivation). Targets with a fixed virtual display
+        refuse this (E_UNSUPPORTED)."""
+        try:
+            return _json(_box().resize(w, h))
+        except GatewayError as e:
+            return _json({"ok": False, "code": e.code, "detail": e.detail})
+
+
+    @mcp.tool()
     async def clipboard_get() -> str:
         """Read the guest clipboard as text."""
         try:

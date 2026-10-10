@@ -221,6 +221,18 @@ class TargetProbe:
             report["ladder"].append({"level": "first_frame", "code": "E_NOFRAME", "detail": e.detail})
             return None, session
         report["desktop"] = {"w": base["w"], "h": base["h"]}
+        # A fully black first frame (cold boot, logon not drawn yet) is not a
+        # frame-mode verdict: no input can repaint a black screen, so give the
+        # desktop a couple of boot waits before classifying.
+        if base.get("mean_lum") == 0:
+            for _ in range(2):
+                time.sleep(15.0)
+                base = session.call("screenshot", {"wait_stable_ms": 3000, "tol_px": 64}, timeout=120)
+                if base.get("mean_lum") != 0:
+                    break
+            else:
+                report["ladder"].append({"level": "first_frame", "code": "E_BLACK", "detail": "mean_lum=0 after boot waits"})
+                return None, session
         w, h = base["w"], base["h"]
         # Hover sweep along the taskbar edge: Start button, pinned-app zone,
         # middle, clock. Hover highlights repaint; the cursor itself is not

@@ -28,6 +28,11 @@ class ToolBox:
     def screenshot(self, wait_stable_ms: int = 1500, tol_px: int = 64) -> dict:
         r = self.session.call("screenshot", {"wait_stable_ms": wait_stable_ms, "tol_px": tol_px}, timeout=120)
         obs = observe(r["png"], r)
+        if obs.get("mean_lum") == 0:
+            raise GatewayError(
+                "E_BLACK",
+                f"frame is fully black (desktop may not be drawn yet); raw shot kept at {r['png']}",
+            )
         self.last_scale = obs["scale"]
         self.session.evidence("observe", {"png": r["png"], "scale": obs["scale"]})
         return obs
