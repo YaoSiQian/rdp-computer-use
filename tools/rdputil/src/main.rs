@@ -258,16 +258,6 @@ COMMON FLAGS:
 ";
 
 fn main() -> anyhow::Result<()> {
-    // Value-aware: probing scripts export RDPUTIL_LEGACY_INPUT=0 to mean "off";
-    // a presence check (is_some) would flip legacy mode on and feed nt5 mouse
-    // values to modern servers, killing the session. (fork-only API — upstream
-    // builds always encode modern constants.)
-    #[cfg(feature = "fork")]
-    ironrdp_pdu::input::set_legacy_input(matches!(
-        std::env::var("RDPUTIL_LEGACY_INPUT").as_deref(),
-        Ok("1") | Ok("true") | Ok("on")
-    ));
-
     let command = match parse_args() {
         Ok(command) => command,
         Err(e) => {
@@ -911,15 +901,13 @@ fn connect_once(
 /// Five verbatim T.124 payloads captured from a reference mstsc session,
 /// hex-embedded below. The inner sender field ([4..6] LE) is patched to our
 /// MCS user id — the server routes T.120 by sender, so a verbatim replay
-/// carrying another client's id is dead air. Frames go out as plain-MAC MCS
-/// SendDataRequests on the I/O channel (the security envelope, incl. the
-/// checksum-disabled variant the announce needs, is applied by
-/// `ActiveStage::secure_raw_frame`), 80 ms apart, right after activation.
+/// carrying another client's id is dead air. Frames go out as MCS
+/// SendDataRequests on the I/O channel; the TLS transport provides the
+/// security envelope. Frames are sent 80 ms apart, right after activation.
 /// Without this announce a legacy server kills any connection that injects
 /// input (10054).
-#[cfg_attr(not(feature = "fork"), allow(unused_variables))]
 pub(crate) fn send_t120_announce(
-    active_stage: &ActiveStage,
+    _active_stage: &ActiveStage,
     framed: &mut AnyFramed,
     user_channel_id: u16,
     io_channel_id: u16,
@@ -962,12 +950,8 @@ pub(crate) fn send_t120_announce(
         let total = frame.len() as u16;
         frame[2..4].copy_from_slice(&total.to_be_bytes());
 
-        // Fork mode encrypts at the frame layer (standard RDP security);
-        // upstream master runs the session over TLS, where the transport
-        // already provides the envelope and the frame goes out as-is.
-        #[cfg(feature = "fork")]
-        let secured = active_stage.secure_raw_frame(frame).context("secure T.120 frame")?;
-        #[cfg(not(feature = "fork"))]
+        // The session runs over TLS: the transport already provides the
+        // security envelope and the frame goes out as-is.
         let secured = frame;
         framed.write_all(secured.as_slice()).context("write T.120 announce")?;
         std::thread::sleep(Duration::from_millis(80));
@@ -1004,8 +988,6 @@ fn active_stage(
         compression_type: connection_result.compression_type,
         enable_server_pointer: connection_result.enable_server_pointer,
         pointer_software_rendering: connection_result.pointer_software_rendering,
-        #[cfg(feature = "fork")]
-        security: connection_result.security,
     }
     .build();
 
@@ -1183,17 +1165,7 @@ pub(crate) fn slow_input_event(event: &FastPathInputEvent) -> anyhow::Result<Inp
             // Down is all bits clear on both. The earlier field conclusion
             // "0x8000 never landed, 0x0001 does" was a misread: a RIGHT-flag
             // down lands as a visible press, masking the missing release.
-            // The fork's legacy-input mode remaps the release bit to nt5
-            // 0x8000; upstream builds always encode the modern 0x0001.
-            #[cfg(feature = "fork")]
-            let legacy_input = ironrdp_pdu::input::legacy_input();
-            #[cfg(not(feature = "fork"))]
-            let legacy_input = false;
-            let release_bit: u16 = if legacy_input {
-                0x8000
-            } else {
-                0x0001
-            };
+            let release_bit: u16 = 0x0001;
             let mut slow: u16 = 0;
             if flags.contains(KeyboardFlags::RELEASE) {
                 slow |= release_bit;
@@ -1284,8 +1256,6 @@ fn run_drive(common: &CommonArgs, image: &mut DecodedImage) -> anyhow::Result<()
             compression_type: connection_result.compression_type,
             enable_server_pointer: connection_result.enable_server_pointer,
             pointer_software_rendering: connection_result.pointer_software_rendering,
-            #[cfg(feature = "fork")]
-            security: connection_result.security,
         }
         .build();
 
@@ -2021,11 +1991,8 @@ pub(crate) fn pump_until(
                         eprintln!("DEACTIVATE ignored (no activation factory; drive mode only)");
                         continue 'pump;
                     };
-                    // Upstream never stashes a mid-session Demand Active; the
-                    // reactivation sequence reads a fresh one from the wire.
-                    #[cfg(feature = "fork")]
-                    let preseed = active_stage.take_pending_demand_active();
-                    #[cfg(not(feature = "fork"))]
+                    // The reactivation sequence reads a fresh Demand Active
+                    // PDU from the wire.
                     let preseed = None;
                     run_reactivation(framed, active_stage, image, factory, preseed)?;
                 }
@@ -2312,19 +2279,6 @@ fn run_reactivation(
                         Err(e) => return Err(anyhow::Error::new(e).context("read reactivation frame")),
                     }
                 };
-                #[cfg(feature = "fork")]
-                let payload = {
-                    let payload = active_stage
-                        .decrypt_inbound_frame(action, &payload)
-                        .map_err(|e| anyhow::Error::new(e).context("decrypt reactivation frame"))?;
-                    if !matches!(action, ironrdp_pdu::Action::X224) {
-                        // Graphics/pointer update mid-reactivation: the cipher stream
-                        // stays in sync, the PDU itself is not part of the sequence.
-                        continue;
-                    }
-                    payload.into_owned()
-                };
-                #[cfg(not(feature = "fork"))]
                 let payload = {
                     // TLS transport delivers plaintext already; stray fast-path
                     // updates are not part of the activation sequence.
@@ -2340,15 +2294,6 @@ fn run_reactivation(
             seq.step_no_input(&mut buf)?
         };
         if let Some(len) = written.size() {
-            // Fork mode encrypts client PDUs at the frame layer: post-activation,
-            // the server drops the connection on unencrypted client PDUs there.
-            // Upstream runs the sequence over TLS, so plaintext is final.
-            #[cfg(feature = "fork")]
-            {
-                let secured = active_stage.secure_outgoing_frame(buf[..len].to_vec())?;
-                framed.write_all(&secured).context("write reactivation pdu")?;
-            }
-            #[cfg(not(feature = "fork"))]
             framed.write_all(&buf[..len]).context("write reactivation pdu")?;
         }
         if let ConnectionActivationState::Finalized {
@@ -2488,17 +2433,12 @@ fn build_config(
     if remote_app && legacy_client {
         eprintln!("WARN RDPUTIL_REMOTE_APP with RDPUTIL_LEGACY_CLIENT: the legacy Info PDU flag set predates RAIL");
     }
-    // Fork mode keeps the legacy-first default: standard RDP security with RC4
-    // frame encryption is the default on legacy servers, CredSSP is opt-in.
-    // Upstream master
-    // implements PROTOCOL_RDP only without encryption (named-pipe special
-    // case), so a plain client must offer TLS+CredSSP or the server drops the
-    // unencrypted ConnectInitial.
-    let credssp_env = std::env::var("RDPUTIL_CREDSSP").as_deref() == Ok("1");
+    // A plain client must offer TLS+CredSSP: servers that require CredSSP
+    // drop an unencrypted ConnectInitial, and standard RDP security
+    // (PROTOCOL_RDP) is only useful with the frame-encryption layer this
+    // client does not drive.
     let (want_tls, want_credssp, want_rdpsec) = if ssl_only {
         (true, false, false)
-    } else if cfg!(feature = "fork") {
-        (credssp_env, credssp_env, true)
     } else {
         (true, true, false)
     };
@@ -2566,8 +2506,6 @@ fn build_config(
         pointer_software_rendering: true,
         multitransport_flags: None,
         support_dyn_vc_gfx_protocol: false,
-        #[cfg(feature = "fork")]
-        legacy_info_flags: legacy_client,
         performance_flags: PerformanceFlags::default(),
         desktop_scale_factor: 0,
         hardware_id: None,

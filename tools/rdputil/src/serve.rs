@@ -1189,8 +1189,6 @@ fn build_stage(cr: ConnectionResult) -> (ActiveStage, ConnectionActivationFactor
         compression_type: cr.compression_type,
         enable_server_pointer: cr.enable_server_pointer,
         pointer_software_rendering: cr.pointer_software_rendering,
-        #[cfg(feature = "fork")]
-        security: cr.security,
     }
     .build();
     (stage, activation, w, h)

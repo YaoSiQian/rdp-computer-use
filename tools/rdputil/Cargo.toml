@@ -2,30 +2,35 @@
 name = "rdputil"
 version = "0.1.0"
 edition = "2021"
-description = "Standalone RDP test client driving IronRDP (path deps into the patched upstream tree)"
+description = "Standalone RDP test client driving IronRDP"
 
-# Two source modes:
-#   default   — official upstream master plus the redirected-volume-root open
-#               fix (experiments/IronRDP-upstream-rdpdrroot; the pristine
-#               upstream checkout lives in experiments/IronRDP-upstream)
-#   fork mode — fork tree: swap "IronRDP-upstream-rdpdrroot" for "IronRDP-src"
-#               in the paths below and add --features fork (enables the
-#               legacy-client switches RDPUTIL_LEGACY_INPUT /
-#               RDPUTIL_LEGACY_CLIENT, which rely on fork-only APIs).
-[features]
-fork = []
-
+# IronRDP is consumed from a git source because two pieces this client needs
+# are not on crates.io yet: the Windows drive-redirection backend
+# (ironrdp-rdpdr-native ships only the nix backend in the published releases)
+# and the RAIL client (ironrdp-rail is unpublished). The branch below is
+# upstream master plus two small drive-redirection fixes, both prepared as
+# upstream contributions:
+#
+#   1. rdpdr-native: the volume-root open must let the drive-letter symbolic
+#      link resolve (OBJ_DONT_REPARSE fails every \??\X:\ open with
+#      STATUS_REPARSE_POINT_ENCOUNTERED, so the guest disables the device).
+#   2. rdpdr: drive DeviceData must be null-terminated ASCII; the Windows
+#      redirector reads it as ASCII regardless of the capability version, so
+#      UTF-16 data truncates the share name to its first character.
+#
+# Once the fixes land upstream, these dependencies can point at the official
+# repository directly.
 [dependencies]
-ironrdp = { path = "../../experiments/IronRDP-upstream-rdpdrroot/crates/ironrdp", features = [
+ironrdp = { git = "https://github.com/YaoSiQian/IronRDP", branch = "fix/windows-drive-redirection", features = [
     "cliprdr", "connector", "session", "graphics", "input", "svc", "dvc", "displaycontrol", "rdpdr",
 ] }
-ironrdp-pdu = { path = "../../experiments/IronRDP-upstream-rdpdrroot/crates/ironrdp-pdu" }
-ironrdp-blocking = { path = "../../experiments/IronRDP-upstream-rdpdrroot/crates/ironrdp-blocking" }
-ironrdp-graphics = { path = "../../experiments/IronRDP-upstream-rdpdrroot/crates/ironrdp-graphics" }
-ironrdp-rdpdr = { path = "../../experiments/IronRDP-upstream-rdpdrroot/crates/ironrdp-rdpdr" }
-ironrdp-rdpdr-native = { path = "../../experiments/IronRDP-upstream-rdpdrroot/crates/ironrdp-rdpdr-native" }
-ironrdp-rdpsnd = { path = "../../experiments/IronRDP-upstream-rdpdrroot/crates/ironrdp-rdpsnd" }
-ironrdp-rail = { path = "../../experiments/IronRDP-upstream-rdpdrroot/crates/ironrdp-rail" }
+ironrdp-pdu = { git = "https://github.com/YaoSiQian/IronRDP", branch = "fix/windows-drive-redirection" }
+ironrdp-blocking = { git = "https://github.com/YaoSiQian/IronRDP", branch = "fix/windows-drive-redirection" }
+ironrdp-graphics = { git = "https://github.com/YaoSiQian/IronRDP", branch = "fix/windows-drive-redirection" }
+ironrdp-rdpdr = { git = "https://github.com/YaoSiQian/IronRDP", branch = "fix/windows-drive-redirection" }
+ironrdp-rdpdr-native = { git = "https://github.com/YaoSiQian/IronRDP", branch = "fix/windows-drive-redirection" }
+ironrdp-rdpsnd = { git = "https://github.com/YaoSiQian/IronRDP", branch = "fix/windows-drive-redirection" }
+ironrdp-rail = { git = "https://github.com/YaoSiQian/IronRDP", branch = "fix/windows-drive-redirection" }
 pico-args = "0.5"
 serde_json = "1"
 base64 = "0.22"
