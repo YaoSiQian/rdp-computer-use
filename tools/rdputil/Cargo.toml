@@ -2,28 +2,30 @@
 name = "rdputil"
 version = "0.1.0"
 edition = "2021"
-description = "Standalone RDP test client driving IronRDP (path deps into experiments/IronRDP-upstream)"
+description = "Standalone RDP test client driving IronRDP (path deps into the patched upstream tree)"
 
 # Two source modes:
-#   default   — official upstream master (experiments/IronRDP-upstream)
-#   fork mode — experiments/IronRDP-upstream fork tree: swap "IronRDP-upstream" for
-#               "IronRDP-src" in the paths below and add --features fork
-#               (enables the legacy-client switches RDPUTIL_LEGACY_INPUT /
+#   default   — official upstream master plus the redirected-volume-root open
+#               fix (experiments/IronRDP-upstream-rdpdrroot; the pristine
+#               upstream checkout lives in experiments/IronRDP-upstream)
+#   fork mode — fork tree: swap "IronRDP-upstream-rdpdrroot" for "IronRDP-src"
+#               in the paths below and add --features fork (enables the
+#               legacy-client switches RDPUTIL_LEGACY_INPUT /
 #               RDPUTIL_LEGACY_CLIENT, which rely on fork-only APIs).
 [features]
 fork = []
 
 [dependencies]
-ironrdp = { path = "../../experiments/IronRDP-upstream/crates/ironrdp", features = [
+ironrdp = { path = "../../experiments/IronRDP-upstream-rdpdrroot/crates/ironrdp", features = [
     "cliprdr", "connector", "session", "graphics", "input", "svc", "dvc", "displaycontrol", "rdpdr",
 ] }
-ironrdp-pdu = { path = "../../experiments/IronRDP-upstream/crates/ironrdp-pdu" }
-ironrdp-blocking = { path = "../../experiments/IronRDP-upstream/crates/ironrdp-blocking" }
-ironrdp-graphics = { path = "../../experiments/IronRDP-upstream/crates/ironrdp-graphics" }
-ironrdp-rdpdr = { path = "../../experiments/IronRDP-upstream/crates/ironrdp-rdpdr" }
-ironrdp-rdpdr-native = { path = "../../experiments/IronRDP-upstream/crates/ironrdp-rdpdr-native" }
-ironrdp-rdpsnd = { path = "../../experiments/IronRDP-upstream/crates/ironrdp-rdpsnd" }
-ironrdp-rail = { path = "../../experiments/IronRDP-upstream/crates/ironrdp-rail" }
+ironrdp-pdu = { path = "../../experiments/IronRDP-upstream-rdpdrroot/crates/ironrdp-pdu" }
+ironrdp-blocking = { path = "../../experiments/IronRDP-upstream-rdpdrroot/crates/ironrdp-blocking" }
+ironrdp-graphics = { path = "../../experiments/IronRDP-upstream-rdpdrroot/crates/ironrdp-graphics" }
+ironrdp-rdpdr = { path = "../../experiments/IronRDP-upstream-rdpdrroot/crates/ironrdp-rdpdr" }
+ironrdp-rdpdr-native = { path = "../../experiments/IronRDP-upstream-rdpdrroot/crates/ironrdp-rdpdr-native" }
+ironrdp-rdpsnd = { path = "../../experiments/IronRDP-upstream-rdpdrroot/crates/ironrdp-rdpsnd" }
+ironrdp-rail = { path = "../../experiments/IronRDP-upstream-rdpdrroot/crates/ironrdp-rail" }
 pico-args = "0.5"
 serde_json = "1"
 base64 = "0.22"
