@@ -260,7 +260,9 @@ COMMON FLAGS:
 fn main() -> anyhow::Result<()> {
     // Value-aware: probing scripts export RDPUTIL_LEGACY_INPUT=0 to mean "off";
     // a presence check (is_some) would flip legacy mode on and feed nt5 mouse
-    // values to modern servers, killing the session.
+    // values to modern servers, killing the session. (fork-only API — upstream
+    // builds always encode modern constants.)
+    #[cfg(feature = "fork")]
     ironrdp_pdu::input::set_legacy_input(matches!(
         std::env::var("RDPUTIL_LEGACY_INPUT").as_deref(),
         Ok("1") | Ok("true") | Ok("on")
@@ -580,7 +582,7 @@ fn run(command: Command) -> anyhow::Result<()> {
         "run"
     );
 
-    let (connection_result, framed, _, _) = connect(&common, false, None).context("connect")?;
+    let (connection_result, framed, _, _, _) = connect(&common, false, None).context("connect")?;
     info!(compression_type = ?connection_result.compression_type, "Negotiated compression");
 
     let mut image = DecodedImage::new(
@@ -608,11 +610,15 @@ fn run(command: Command) -> anyhow::Result<()> {
 
 /// Drives the connection sequence, retrying on failure. Kept at 3 attempts:
 /// some servers rate-limit repeated SYNs from one source port.
+/// Latest DISP dynamic channel id, minted by the factory listener on every
+/// server Create (u32::MAX = none seen yet).
+pub(crate) type DispChannelId = Arc<AtomicU32>;
+
 pub(crate) fn connect(
     common: &CommonArgs,
     cliprdr: bool,
     rdpdr: Option<&std::path::Path>,
-) -> anyhow::Result<(ConnectionResult, AnyFramed, Option<ClipState>, Option<RdpdrGate>)> {
+) -> anyhow::Result<(ConnectionResult, AnyFramed, Option<ClipState>, Option<RdpdrGate>, DispChannelId)> {
     const MAX_ATTEMPTS: usize = 3;
 
     let mut last_error = None;
@@ -667,13 +673,47 @@ pub(crate) fn classify_connect_error(err: &anyhow::Error) -> &'static str {
     "E_CONN"
 }
 
+/// Encodes a display-control resize without `ActiveStage::encode_resize`:
+/// that path resolves the channel by TypeId, which upstream reserves for
+/// `with_dynamic_channel` registrations, while listener-created channels —
+/// the factory that survives server Close + re-Create cycles — are only
+/// reachable by channel id. Returns `Ok(None)` when no DISP channel is live
+/// (or its capabilities have not arrived yet).
+pub(crate) fn encode_disp_resize(
+    stage: &mut ActiveStage,
+    disp_channel_id: u32,
+    width: u32,
+    height: u32,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    if disp_channel_id == u32::MAX {
+        return Ok(None);
+    }
+    let messages = {
+        let Some(dvc) = stage
+            .get_dvc_by_channel_id::<ironrdp::displaycontrol::client::DisplayControlClient>(disp_channel_id)
+        else {
+            return Ok(None);
+        };
+        if !dvc.processor().ready() {
+            return Ok(None);
+        }
+        dvc.processor()
+            .encode_single_primary_monitor(disp_channel_id, width, height, None, None)
+            .map_err(|e| anyhow::Error::new(e).context("encode monitor layout"))?
+    };
+    stage
+        .encode_dvc_messages(messages)
+        .map(Some)
+        .map_err(|e| anyhow::Error::new(e).context("encode DVC frame"))
+}
+
 fn connect_once(
     config: connector::Config,
     server_name: &str,
     port: u16,
     cliprdr: bool,
     rdpdr: Option<&std::path::Path>,
-) -> anyhow::Result<(ConnectionResult, AnyFramed, Option<ClipState>, Option<RdpdrGate>)> {
+) -> anyhow::Result<(ConnectionResult, AnyFramed, Option<ClipState>, Option<RdpdrGate>, DispChannelId)> {
     // Windows couples rdpdr initialization to audio support: with
     // INFO_NOAUDIOPLAYBACK set in the Client Info PDU the server never starts
     // the rdpdr handshake, no matter that the RDPSND static channel is
@@ -720,11 +760,11 @@ fn connect_once(
     // the connector refuses a server-selected protocol it did not offer.
     let skip_tls = config.enable_standard_rdp_security && !config.enable_tls && !config.enable_credssp;
 
-    let mut connector = connector::ClientConnector::new(config, client_addr);
+    let connector = connector::ClientConnector::new(config, client_addr);
 
     let mut connector = if let Ok(path) = std::env::var("RDPUTIL_COOKIE_IN") {
         match std::fs::read(&path) {
-            Ok(mut bytes) => {
+            Ok(bytes) => {
                 let decoded: Result<ironrdp_pdu::rdp::session_info::ServerAutoReconnect, _> =
                     ironrdp_pdu::Decode::decode(&mut ironrdp_pdu::cursor::ReadCursor::new(&bytes));
                 match decoded {
@@ -789,10 +829,33 @@ fn connect_once(
     // behind DRDYNVC so the drive-mode `resize W H` command can change the
     // guest resolution on the fly (MS-RDPEDISP). Attach before connect_begin
     // so the channel is negotiated in the GCC like cliprdr above.
+    //
+    // Factory listener: a fresh processor on every server CREATE, so a
+    // close + re-create cycle keeps the channel alive on stock upstream
+    // (with_dynamic_channel's OnceListener is single-use there). Each Create
+    // mints a new channel id; the shared atomic tracks the latest one
+    // (u32::MAX = no Create seen yet) so resizes can reach the processor by
+    // id — upstream's TypeId lookup does not cover listener-created channels.
+    let disp_channel_id: DispChannelId = Arc::new(AtomicU32::new(u32::MAX));
     if std::env::var("RDPUTIL_DISP").as_deref() == Ok("1") {
+        struct DispControlFactory(Arc<AtomicU32>);
+
+        impl ironrdp::dvc::DvcChannelListener for DispControlFactory {
+            fn channel_name(&self) -> &str {
+                ironrdp::displaycontrol::CHANNEL_NAME
+            }
+
+            fn create(
+                &mut self,
+                channel_id: ironrdp::dvc::DynamicChannelId,
+            ) -> Option<Box<dyn ironrdp::dvc::DvcClientProcessor>> {
+                self.0.store(channel_id, Ordering::SeqCst);
+                Some(Box::new(ironrdp::displaycontrol::client::DisplayControlClient::new(|_| Ok(Vec::new()))))
+            }
+        }
+
         connector = connector.with_static_channel(
-            ironrdp::dvc::DrdynvcClient::new()
-                .with_dynamic_channel(ironrdp::displaycontrol::client::DisplayControlClient::new(|_| Ok(Vec::new()))),
+            ironrdp::dvc::DrdynvcClient::new().with_listener(DispControlFactory(Arc::clone(&disp_channel_id))),
         );
     }
 
@@ -840,7 +903,7 @@ fn connect_once(
         connection_result.static_channels.get_channel_id_by_type::<ironrdp_rdpsnd::client::Rdpsnd>(),
     );
 
-    Ok((connection_result, framed, clip, rdpdr_gate))
+    Ok((connection_result, framed, clip, rdpdr_gate, disp_channel_id))
 }
 
 /// Replays the mstsc MS_T120 static-channel announce on the I/O channel.
@@ -854,6 +917,7 @@ fn connect_once(
 /// `ActiveStage::secure_raw_frame`), 80 ms apart, right after activation.
 /// Without this announce a legacy server kills any connection that injects
 /// input (10054).
+#[cfg_attr(not(feature = "fork"), allow(unused_variables))]
 pub(crate) fn send_t120_announce(
     active_stage: &ActiveStage,
     framed: &mut AnyFramed,
@@ -898,7 +962,13 @@ pub(crate) fn send_t120_announce(
         let total = frame.len() as u16;
         frame[2..4].copy_from_slice(&total.to_be_bytes());
 
+        // Fork mode encrypts at the frame layer (standard RDP security);
+        // upstream master runs the session over TLS, where the transport
+        // already provides the envelope and the frame goes out as-is.
+        #[cfg(feature = "fork")]
         let secured = active_stage.secure_raw_frame(frame).context("secure T.120 frame")?;
+        #[cfg(not(feature = "fork"))]
+        let secured = frame;
         framed.write_all(secured.as_slice()).context("write T.120 announce")?;
         std::thread::sleep(Duration::from_millis(80));
     }
@@ -934,6 +1004,7 @@ fn active_stage(
         compression_type: connection_result.compression_type,
         enable_server_pointer: connection_result.enable_server_pointer,
         pointer_software_rendering: connection_result.pointer_software_rendering,
+        #[cfg(feature = "fork")]
         security: connection_result.security,
     }
     .build();
@@ -1091,7 +1162,6 @@ fn active_stage(
 /// slow-path: u16 DOWN=0x4000/RELEASE=0x8000/EXTENDED=0x0100/EXTENDED_1=0x0200),
 /// and slow-path keyboard events carry an explicit DOWN bit.
 pub(crate) fn slow_input_event(event: &FastPathInputEvent) -> anyhow::Result<InputEvent> {
-    use ironrdp_pdu::input::scan_code::KeyboardFlags as SlowKbFlags;
     use ironrdp_pdu::input::unicode;
     Ok(match event {
         FastPathInputEvent::MouseEvent(mp) => {
@@ -1113,7 +1183,13 @@ pub(crate) fn slow_input_event(event: &FastPathInputEvent) -> anyhow::Result<Inp
             // Down is all bits clear on both. The earlier field conclusion
             // "0x8000 never landed, 0x0001 does" was a misread: a RIGHT-flag
             // down lands as a visible press, masking the missing release.
-            let release_bit: u16 = if ironrdp_pdu::input::legacy_input() {
+            // The fork's legacy-input mode remaps the release bit to nt5
+            // 0x8000; upstream builds always encode the modern 0x0001.
+            #[cfg(feature = "fork")]
+            let legacy_input = ironrdp_pdu::input::legacy_input();
+            #[cfg(not(feature = "fork"))]
+            let legacy_input = false;
+            let release_bit: u16 = if legacy_input {
                 0x8000
             } else {
                 0x0001
@@ -1186,7 +1262,7 @@ fn run_drive(common: &CommonArgs, image: &mut DecodedImage) -> anyhow::Result<()
     let mut round = 0u32;
     loop {
         round += 1;
-        let (connection_result, mut framed, clip, _) = match connect(common, cliprdr_enabled, None) {
+        let (connection_result, mut framed, clip, _, disp_channel_id) = match connect(common, cliprdr_enabled, None) {
             Ok(ok) => ok,
             Err(e) => {
                 if !reconnect {
@@ -1208,6 +1284,7 @@ fn run_drive(common: &CommonArgs, image: &mut DecodedImage) -> anyhow::Result<()
             compression_type: connection_result.compression_type,
             enable_server_pointer: connection_result.enable_server_pointer,
             pointer_software_rendering: connection_result.pointer_software_rendering,
+            #[cfg(feature = "fork")]
             security: connection_result.security,
         }
         .build();
@@ -1250,7 +1327,7 @@ fn run_drive(common: &CommonArgs, image: &mut DecodedImage) -> anyhow::Result<()
 
         // Fresh per connection: the channel ids it holds change on reconnect.
         let activation = connection_result.activation_factory;
-        match drive_loop(&mut framed, &mut stage, image, &rx, clip.as_ref(), &activation) {
+        match drive_loop(&mut framed, &mut stage, image, &rx, clip.as_ref(), &activation, &disp_channel_id) {
             Ok(()) => {
                 eprintln!("DRIVE graceful end round={round}");
                 return Ok(());
@@ -1530,6 +1607,7 @@ fn drive_loop(
     rx: &std::sync::mpsc::Receiver<String>,
     clip: Option<&ClipState>,
     activation: &ConnectionActivationFactory,
+    disp_channel_id: &DispChannelId,
 ) -> anyhow::Result<()> {
     eprintln!("DRIVE ready");
 
@@ -1610,16 +1688,21 @@ fn drive_loop(
                         // width must be even.
                         let w = w.parse::<u32>()?.clamp(200, 8192) & !1;
                         let h = h.parse::<u32>()?.clamp(200, 8192);
-                        match active_stage.encode_resize(w, h, None, None) {
-                            Some(Ok(frame)) => {
+                        match encode_disp_resize(
+                            active_stage,
+                            disp_channel_id.load(Ordering::SeqCst),
+                            w,
+                            h,
+                        ) {
+                            Ok(Some(frame)) => {
                                 framed.write_all(frame.as_slice()).context("write resize")?;
                                 eprintln!("RESIZE sent {w}x{h}; pumping for reactivation");
                                 let deadline = Instant::now() + Duration::from_secs(10);
                                 pump_until(framed, active_stage, image, deadline, Some(activation))?;
                                 eprintln!("RESIZE now {}x{}", image.width(), image.height());
                             }
-                            Some(Err(e)) => eprintln!("RESIZE encode failed: {e:#}"),
-                            None => eprintln!("RESIZE unavailable (restart with RDPUTIL_DISP=1?)"),
+                            Ok(None) => eprintln!("RESIZE unavailable (restart with RDPUTIL_DISP=1?)"),
+                            Err(e) => eprintln!("RESIZE encode failed: {e:#}"),
                         }
                         Ok(())
                     }
@@ -1938,7 +2021,12 @@ pub(crate) fn pump_until(
                         eprintln!("DEACTIVATE ignored (no activation factory; drive mode only)");
                         continue 'pump;
                     };
+                    // Upstream never stashes a mid-session Demand Active; the
+                    // reactivation sequence reads a fresh one from the wire.
+                    #[cfg(feature = "fork")]
                     let preseed = active_stage.take_pending_demand_active();
+                    #[cfg(not(feature = "fork"))]
+                    let preseed = None;
                     run_reactivation(framed, active_stage, image, factory, preseed)?;
                 }
                 ActiveStageOutput::AutoReconnectCookie(cookie) => {
@@ -2224,26 +2312,44 @@ fn run_reactivation(
                         Err(e) => return Err(anyhow::Error::new(e).context("read reactivation frame")),
                     }
                 };
-                let payload = active_stage
-                    .decrypt_inbound_frame(action, &payload)
-                    .map_err(|e| anyhow::Error::new(e).context("decrypt reactivation frame"))?;
-                if !matches!(action, ironrdp_pdu::Action::X224) {
-                    // Graphics/pointer update mid-reactivation: the cipher stream
-                    // stays in sync, the PDU itself is not part of the sequence.
-                    continue;
-                }
-                payload.into_owned()
+                #[cfg(feature = "fork")]
+                let payload = {
+                    let payload = active_stage
+                        .decrypt_inbound_frame(action, &payload)
+                        .map_err(|e| anyhow::Error::new(e).context("decrypt reactivation frame"))?;
+                    if !matches!(action, ironrdp_pdu::Action::X224) {
+                        // Graphics/pointer update mid-reactivation: the cipher stream
+                        // stays in sync, the PDU itself is not part of the sequence.
+                        continue;
+                    }
+                    payload.into_owned()
+                };
+                #[cfg(not(feature = "fork"))]
+                let payload = {
+                    // TLS transport delivers plaintext already; stray fast-path
+                    // updates are not part of the activation sequence.
+                    if !matches!(action, ironrdp_pdu::Action::X224) {
+                        continue;
+                    }
+                    payload.to_vec()
+                };
+                payload
             };
             seq.step(&payload, framed.last_read_at(), &mut buf)?
         } else {
             seq.step_no_input(&mut buf)?
         };
         if let Some(len) = written.size() {
-            // Sequence output bypasses ActiveStage::process, so the security
-            // envelope must be applied here: post-activation, the server
-            // drops the connection on unencrypted client PDUs.
-            let secured = active_stage.secure_outgoing_frame(buf[..len].to_vec())?;
-            framed.write_all(&secured).context("write reactivation pdu")?;
+            // Fork mode encrypts client PDUs at the frame layer: post-activation,
+            // the server drops the connection on unencrypted client PDUs there.
+            // Upstream runs the sequence over TLS, so plaintext is final.
+            #[cfg(feature = "fork")]
+            {
+                let secured = active_stage.secure_outgoing_frame(buf[..len].to_vec())?;
+                framed.write_all(&secured).context("write reactivation pdu")?;
+            }
+            #[cfg(not(feature = "fork"))]
+            framed.write_all(&buf[..len]).context("write reactivation pdu")?;
         }
         if let ConnectionActivationState::Finalized {
             desktop_size,
@@ -2382,12 +2488,26 @@ fn build_config(
     if remote_app && legacy_client {
         eprintln!("WARN RDPUTIL_REMOTE_APP with RDPUTIL_LEGACY_CLIENT: the legacy Info PDU flag set predates RAIL");
     }
+    // Fork mode keeps the legacy-first default: standard RDP security with RC4
+    // frame encryption is the default on legacy servers, CredSSP is opt-in.
+    // Upstream master
+    // implements PROTOCOL_RDP only without encryption (named-pipe special
+    // case), so a plain client must offer TLS+CredSSP or the server drops the
+    // unencrypted ConnectInitial.
+    let credssp_env = std::env::var("RDPUTIL_CREDSSP").as_deref() == Ok("1");
+    let (want_tls, want_credssp, want_rdpsec) = if ssl_only {
+        (true, false, false)
+    } else if cfg!(feature = "fork") {
+        (credssp_env, credssp_env, true)
+    } else {
+        (true, true, false)
+    };
     Ok(connector::Config {
         credentials: Credentials::UsernamePassword { username, password },
         domain,
-        enable_tls: if ssl_only { true } else { std::env::var("RDPUTIL_CREDSSP").as_deref() == Ok("1") },
-        enable_credssp: if ssl_only { false } else { std::env::var("RDPUTIL_CREDSSP").as_deref() == Ok("1") },
-        enable_standard_rdp_security: !ssl_only,
+        enable_tls: want_tls,
+        enable_credssp: want_credssp,
+        enable_standard_rdp_security: want_rdpsec,
         keyboard_type: KeyboardType::IBM_ENHANCED,
         keyboard_subtype: 0,
         keyboard_layout: 0,
@@ -2446,6 +2566,7 @@ fn build_config(
         pointer_software_rendering: true,
         multitransport_flags: None,
         support_dyn_vc_gfx_protocol: false,
+        #[cfg(feature = "fork")]
         legacy_info_flags: legacy_client,
         performance_flags: PerformanceFlags::default(),
         desktop_scale_factor: 0,

@@ -23,7 +23,8 @@ use core::time::Duration;
 use std::collections::HashSet;
 use std::io::{BufRead, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, TryRecvError};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, mpsc::{self, TryRecvError}};
 use std::time::Instant;
 
 use anyhow::Context as _;
@@ -47,9 +48,9 @@ use ironrdp_pdu::WriteBuf;
 use ironrdp_rail::pdu::{SystemCommand, SystemCommandPdu};
 
 use crate::{
-    classify_connect_error, clip_tick, connect, frame_hash, golden_text_formats, pump_until, rail_exec_verdict,
-    rail_kickoff, rail_reset, remote_app_label, send_input_event, send_t120_announce, session_mode, AnyFramed,
-    ClipState, CommonArgs, RdpdrCap, RdpdrGate, RAIL_EXEC_OK, RAIL_WINDOW, RDPDR_DRIVE_NAME,
+    classify_connect_error, clip_tick, connect, encode_disp_resize, frame_hash, golden_text_formats, pump_until,
+    rail_exec_verdict, rail_kickoff, rail_reset, remote_app_label, send_input_event, send_t120_announce, session_mode,
+    AnyFramed, ClipState, CommonArgs, DispChannelId, RdpdrCap, RdpdrGate, RAIL_EXEC_OK, RAIL_WINDOW, RDPDR_DRIVE_NAME,
 };
 use crate::rail::{RailClient, RailInputEvent};
 
@@ -232,10 +233,15 @@ struct Daemon {
     /// Volume-root form (`X:\`) of the redirect share, kept in sync with the
     /// SUBST drive held in `subst`.
     rdpdr_root: Option<PathBuf>,
+    // Never read; holding the drive keeps its Drop (`subst /D`) armed.
+    #[allow(dead_code)]
     subst: Option<SubstDrive>,
     /// Server verdict on the drive-share announcement; None when the daemon
     /// runs without --rdpdr.
     rdpdr_gate: Option<RdpdrGate>,
+    /// Latest DISP dynamic channel id minted by the factory listener; the
+    /// server Close + re-Create cycle replaces it.
+    disp_channel_id: DispChannelId,
     status: &'static str,
     connected_at: Option<Instant>,
     inputs_total: u64,
@@ -278,6 +284,7 @@ pub(crate) fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
         rdpdr_root,
         subst: subst,
         rdpdr_gate: None,
+        disp_channel_id: Arc::new(AtomicU32::new(u32::MAX)),
         status: "connecting",
         connected_at: None,
         inputs_total: 0,
@@ -838,9 +845,10 @@ impl Daemon {
         let w = w_req as u32 & !1;
         let h = h_req as u32;
         let new_size = {
+            let disp_id = self.disp_channel_id.load(Ordering::SeqCst);
             let Conn { framed, stage, image, activation, .. } = self.conn.as_mut().unwrap();
-            match stage.encode_resize(w, h, None, None) {
-                Some(Ok(frame)) => {
+            match encode_disp_resize(stage, disp_id, w, h) {
+                Ok(Some(frame)) => {
                     framed.write_all(frame.as_slice()).map_err(|e| serr("E_PROTO", format!("write resize: {e}")))?;
                     // Pump through the Deactivation-Reactivation Sequence; it
                     // carries the new desktop size and pump_until rebuilds the
@@ -849,8 +857,8 @@ impl Daemon {
                         .map_err(SrvErr::from)?;
                     Ok((image.width(), image.height()))
                 }
-                Some(Err(e)) => Err(serr("E_PROTO", format!("resize encode failed: {e:#}"))),
-                None => Err(serr("E_UNSUPPORTED", "display control not attached at connect time")),
+                Ok(None) => Err(serr("E_UNSUPPORTED", "display control not attached at connect time")),
+                Err(e) => Err(serr("E_PROTO", format!("resize encode failed: {e:#}"))),
             }
         };
         // The framebuffer changed wholesale: re-arm the golden rule even on
@@ -1015,7 +1023,7 @@ impl Daemon {
     fn sacrifice(&mut self) {
         self.emit(json!({"ev": "session", "state": "sacrificing"}));
         let outcome = (|| -> anyhow::Result<()> {
-            let (cr, mut framed, _, _) = connect(&self.common, false, None)?;
+            let (cr, mut framed, _, _, _) = connect(&self.common, false, None)?;
             let user_channel_id = cr.user_channel_id;
             let io_channel_id = cr.io_channel_id;
             let (mut stage, _, w, h) = build_stage(cr);
@@ -1036,7 +1044,8 @@ impl Daemon {
         self.status = "connecting";
         self.emit(json!({"ev": "session", "state": "connecting", "attempt": self.reconnects}));
             match connect(&self.common, self.args.cliprdr, self.rdpdr_root.as_deref()) {
-            Ok((cr, framed, clip, gate)) => {
+            Ok((cr, framed, clip, gate, disp)) => {
+                self.disp_channel_id = disp;
                 let user_channel_id = cr.user_channel_id;
                 let io_channel_id = cr.io_channel_id;
                 let repaint = self.reconnects > 0;
@@ -1180,6 +1189,7 @@ fn build_stage(cr: ConnectionResult) -> (ActiveStage, ConnectionActivationFactor
         compression_type: cr.compression_type,
         enable_server_pointer: cr.enable_server_pointer,
         pointer_software_rendering: cr.pointer_software_rendering,
+        #[cfg(feature = "fork")]
         security: cr.security,
     }
     .build();
