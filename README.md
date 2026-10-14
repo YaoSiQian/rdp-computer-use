@@ -93,6 +93,10 @@ export MYPC_PASS='...'
 python -m gateway --mcp --profile mypc
 ```
 
+Entries can also import connection facts from an `.rdp` file
+(`"rdp_file": "path/to/file.rdp"`) instead of repeating host/username —
+see section 3.1 of [docs/USAGE.md](docs/USAGE.md).
+
 ## Wiring it into an agent harness
 
 The gateway is a standard MCP stdio server, so it plugs into every harness

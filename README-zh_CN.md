@@ -93,6 +93,9 @@ export MYPC_PASS='...'
 python -m gateway --mcp --profile mypc
 ```
 
+条目也可以直接导入 `.rdp` 文件（`"rdp_file": "path/to/file.rdp"`），
+无需重复填写 host/username——见 [docs/USAGE.md](docs/USAGE.md) 第 3.1 节。
+
 ## 接入 agent harness
 
 gateway 是标准 MCP stdio 服务，任何支持 MCP 的 harness 都能直接接入。

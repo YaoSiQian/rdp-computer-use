@@ -44,6 +44,7 @@ toolbox() call quietly returns to a fresh desktop session.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 import time
@@ -52,7 +53,10 @@ from pathlib import Path
 from .api import ToolBox
 from .oneshot import OneShotSession
 from .probe import run_probe
+from .rdp_file import rdp_to_profile
 from .session import GatewayError, RdpSession
+
+logger = logging.getLogger(__name__)
 
 PROFILE_FILE = Path(__file__).resolve().parent / "profiles.json"
 
@@ -72,9 +76,32 @@ def load_profiles() -> dict:
     raw = json.loads(path.read_text(encoding="utf-8"))
     profiles = raw.get("profiles", raw)
     for name, prof in profiles.items():
+        if prof.get("rdp_file"):
+            prof = _import_rdp_file(path.parent, name, prof)
+            profiles[name] = prof
         env_key = prof.get("password_env", f"GATEWAY_{name.upper()}_PASS")
         prof.setdefault("password_env", env_key)
     return profiles
+
+
+def _import_rdp_file(base_dir: Path, name: str, prof: dict) -> dict:
+    """Resolve an entry's `rdp_file` into gateway-native profile keys.
+
+    The .rdp file supplies the connection facts; keys written in the profile
+    entry are the orchestration overlay and win on conflict. Mapping results
+    (disabled clipboard, accepted no-ops, ...) are recorded in `rdp_notes`.
+    """
+    rdp_path = Path(prof["rdp_file"])
+    if not rdp_path.is_absolute():
+        rdp_path = base_dir / rdp_path
+    if not rdp_path.exists():
+        raise RuntimeError(f"profile '{name}': rdp_file not found: {rdp_path}")
+    imported = rdp_to_profile(rdp_path)
+    merged = {**imported, **{k: v for k, v in prof.items() if k != "rdp_file"}}
+    merged["rdp_file"] = str(rdp_path)
+    for note in imported["rdp_notes"]:
+        logger.info("profile '%s' rdp_file: %s", name, note)
+    return merged
 
 
 def save_profiles(profiles: dict) -> None:
@@ -201,13 +228,34 @@ class SessionPool:
         if self._engine(prof) == "oneshot":
             if remote_app:
                 raise GatewayError("E_UNSUPPORTED", "one-shot engine has no RemoteApp session mode")
+            if prof.get("port") not in (None, 3389) or prof.get("domain"):
+                raise GatewayError(
+                    "E_UNSUPPORTED",
+                    "one-shot connections accept no port/domain; values imported from an rdp_file need the "
+                    "daemon engine (set engine: daemon or clear the keys)",
+                )
             return OneShotSession(
                 desktop_size=prof.get("desktop_size"),
                 retry_attempts=int(prof.get("retry_attempts", 3)),
                 retry_interval_s=float(prof.get("retry_interval_s", 15.0)),
                 **common,
             )
-        return RdpSession(rdpdr=bool(prof.get("rdpdr", False)), remote_app=remote_app, extra_env=extra_env, **common)
+        extra_args: list[str] = []
+        if prof.get("port") not in (None, 3389):
+            extra_args += ["--port", str(prof["port"])]
+        if prof.get("domain"):
+            extra_args += ["--domain", prof["domain"]]
+        if prof.get("desktop_size"):
+            width, height = prof["desktop_size"]
+            extra_args += ["--w", str(width), "--h", str(height)]
+        return RdpSession(
+            rdpdr=bool(prof.get("rdpdr", False)),
+            cliprdr=bool(prof.get("cliprdr", True)),
+            remote_app=remote_app,
+            extra_env=extra_env,
+            extra_args=extra_args,
+            **common,
+        )
 
     @staticmethod
     def _engine(prof: dict) -> str:

@@ -65,6 +65,7 @@ pip install -r requirements.txt    # mcp, fastapi, uvicorn, pillow (Python 3.10+
 | `host` | str | required | target hostname or IP |
 | `username` | str | required | RDP login user |
 | `password_env` | str | `GATEWAY_<NAME>_PASS` | env var holding the password; the file itself never contains secrets |
+| `rdp_file` | str | - | import connection facts from an `.rdp` file (see below) |
 | `rdpdr` | bool | `false` | enable drive redirection (file push/pull as `\\tsclient\<share>`) |
 | `display_control` | bool | `false` | enable `resize` via the display-control channel |
 | `engine` | str | `daemon` | `oneshot` for targets that dislike long-lived sessions (e.g. xrdp) |
@@ -77,6 +78,29 @@ exported before starting the gateway:
 ```bash
 export GATEWAY_MYPC_PASS='...'
 ```
+
+### 3.1 Importing .rdp files
+
+An entry may point at an `.rdp` file (mstsc "Save As", AVD portal download,
+hand-written) instead of repeating its connection facts:
+
+```json
+{"mypc": {"rdp_file": "connections/mypc.rdp", "rdpdr": true}}
+```
+
+The file is the connection-capability base; the keys written in the profile
+entry are the orchestration overlay and win on conflict. Passwords always
+resolve from `password_env` — never from the file. The import maps
+`full address` (with port split), `server port`, `username`, `domain`,
+`desktopwidth`/`desktopheight` (initial canvas), `redirectclipboard:i:0`
+(disables the clipboard channel) and `drivestoredirect` (enables drive
+redirection against the gateway's dedicated redirect root — never the drives
+the file lists). Documented properties the daemon does not implement
+(multimon, printer/smart-card redirection, audio, RemoteApp-at-connect, ...)
+are accepted as no-ops and reported, and the profile keys that would demand
+unsupported machinery are rejected with a clear error at startup: DPAPI
+`password 51:b` blobs, `gatewayhostname` (RD Gateway), `kdcproxyname`, and
+Entra ID auth flags (`enablerdsaadauth`, `targetisaadjoined:i:1`).
 
 ## 4. Running the gateway
 

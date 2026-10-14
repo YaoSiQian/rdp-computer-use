@@ -27,6 +27,11 @@
       "desktop_size": [1024, 768],
       "retry_attempts": 3,
       "retry_interval_s": 15.0
+    },
+    "imported": {
+      "rdp_file": "connections/imported.rdp",
+      "password_env": "GATEWAY_IMPORTED_PASS",
+      "rdpdr": true
     }
   }
 }
