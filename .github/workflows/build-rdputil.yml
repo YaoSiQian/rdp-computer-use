@@ -1,0 +1,68 @@
+name: build-rdputil
+
+# Builds the rdputil RDP client daemon (tools/rdputil) on every push to
+# main, on PRs touching it, on demand, and for published releases.
+# The resulting binary is uploaded as a workflow artifact; release runs
+# also attach it to the GitHub release.
+#
+# The client currently targets Windows (the drive-redirection backend is
+# the native Windows implementation), so the job runs on windows-latest.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "tools/rdputil/**"
+      - ".github/workflows/build-rdputil.yml"
+  pull_request:
+    paths:
+      - "tools/rdputil/**"
+      - ".github/workflows/build-rdputil.yml"
+  workflow_dispatch:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write # release runs attach the binary to the release
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo state
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/rdputil
+
+      # aws-lc-sys (rustls' crypto provider) assembles its Windows build
+      # with NASM; cmake is preinstalled on the runner, NASM is not.
+      - name: Install NASM
+        run: |
+          choco install nasm --yes --no-progress
+          Add-Content $env:GITHUB_PATH 'C:\Program Files\NASM'
+
+      - name: Build (release)
+        run: cargo build --release --manifest-path tools/rdputil/Cargo.toml
+
+      - name: Smoke check
+        shell: bash
+        run: |
+          ./tools/rdputil/target/release/rdputil.exe --help > help.txt 2>&1 || true
+          grep -q . help.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdputil-windows-x64
+          path: tools/rdputil/target/release/rdputil.exe
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: tools/rdputil/target/release/rdputil.exe

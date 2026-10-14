@@ -1,0 +1,5 @@
+# Python 3.10+ — gateway (MCP / HTTP server) dependencies
+mcp>=1.2
+fastapi>=0.110
+uvicorn>=0.29
+pillow>=10.0

@@ -45,7 +45,8 @@ def _default_daemon() -> Path:
     override = os.environ.get("GATEWAY_RDPUTIL")
     if override:
         return Path(override)
-    return Path(__file__).resolve().parent.parent / "tools" / "rdputil" / "target" / "release" / "rdputil.exe"
+    binary = "rdputil.exe" if os.name == "nt" else "rdputil"
+    return Path(__file__).resolve().parent.parent / "tools" / "rdputil" / "target" / "release" / binary
 
 
 class RdpSession:

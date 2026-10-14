@@ -5,3 +5,6 @@ tools/rdputil/target/
 tools/rdputil/.cargo/config.toml
 gateway/profiles.json
 runs/
+runs*/
+captures/
+.zcode/
